@@ -179,6 +179,9 @@ func resolveTUICServerName() string {
 	if CFDomain != "" {
 		return stripScheme(CFDomain)
 	}
+	if publicIP := fetchPublicIPv4(); publicIP != "" {
+		return publicIP
+	}
 	return "oneimg.local"
 }
 
