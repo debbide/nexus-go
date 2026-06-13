@@ -32,15 +32,33 @@ import (
 )
 
 const (
-	singBoxVLESSListenPort uint16 = 49101
-	singBoxTUICDefaultName        = "nexus"
+	singBoxTUICDefaultName = "nexus"
 )
+
+// singBoxVLESSListenPort 在启动时动态分配，避免多实例端口冲突
+var singBoxVLESSListenPort uint16
+
+func findFreeLocalPort() (uint16, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
+	return uint16(l.Addr().(*net.TCPAddr).Port), nil
+}
 
 type singBoxRuntime struct {
 	instance *box.Box
 }
 
 func startSingBoxRuntime() (*singBoxRuntime, error) {
+	// 动态获取一个空闲的本地端口给 VLESS 内部监听
+	vlessPort, err := findFreeLocalPort()
+	if err != nil {
+		return nil, fmt.Errorf("find free port for VLESS: %w", err)
+	}
+	singBoxVLESSListenPort = vlessPort
+
 	tuicPort, err := parseUint16Port(TUICPort)
 	if err != nil {
 		return nil, fmt.Errorf("invalid TUIC_PORT: %w", err)
