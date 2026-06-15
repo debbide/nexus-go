@@ -1,13 +1,6 @@
 name: Build and Compress
 
 on:
-  push:
-    branches: [ "main" ]
-    paths-ignore:
-      - 'nexus-linux'
-      - 'nexus-linux-arm64'
-      - 'README.md'
-      - 'LICENSE'
   workflow_dispatch:
 
 permissions:
