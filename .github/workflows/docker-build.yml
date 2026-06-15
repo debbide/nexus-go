@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       uuid:
-        description: '您的专属 UUID (必填)'
+        description: 'UUID (必填)'
         required: true
         default: '7bd180e8-1142-4387-93f5-03e8d750a896'
         type: string
@@ -14,10 +14,51 @@ on:
         default: '3000'
         type: string
       cf_token:
-        description: 'Cloudflare Tunnel Token (选填，留空则不开启)'
+        description: 'CF Tunnel Token (选填)'
         required: false
         type: string
-      # 您可以在这里依葫芦画瓢继续添加更多输入框，比如 nezha_server 等
+      domain:
+        description: '自定义域名 (选填)'
+        required: false
+        type: string
+      sub_path:
+        description: '订阅隐藏路径 (默认 sub)'
+        required: false
+        default: 'sub'
+        type: string
+      auto_access:
+        description: '自动保活 AUTO_ACCESS (选填，true/false)'
+        required: false
+        type: string
+      wspath:
+        description: 'WS 路径 (选填，留空取 UUID 前8位)'
+        required: false
+        type: string
+      node_name:
+        description: '节点名称 NAME (选填)'
+        required: false
+        type: string
+      nezha_server:
+        description: '哪吒探针地址 (选填)'
+        required: false
+        type: string
+      nezha_key:
+        description: '哪吒探针密钥 (选填)'
+        required: false
+        type: string
+      tuic_port:
+        description: 'TUIC 监听端口 (默认 30018)'
+        required: false
+        default: '30018'
+        type: string
+      tuic_domain:
+        description: 'TUIC 自签证书域名 (选填)'
+        required: false
+        type: string
+      tuic_password:
+        description: 'TUIC 密码 (选填，留空同 UUID)'
+        required: false
+        type: string
 
 jobs:
   build:
@@ -31,6 +72,16 @@ jobs:
           echo "UUID=${{ inputs.uuid }}" > .env
           echo "PORT=${{ inputs.port }}" >> .env
           echo "CF_TUNNEL_TOKEN=${{ inputs.cf_token }}" >> .env
+          echo "DOMAIN=${{ inputs.domain }}" >> .env
+          echo "SUB_PATH=${{ inputs.sub_path }}" >> .env
+          echo "AUTO_ACCESS=${{ inputs.auto_access }}" >> .env
+          echo "WSPATH=${{ inputs.wspath }}" >> .env
+          echo "NAME=${{ inputs.node_name }}" >> .env
+          echo "NEZHA_SERVER=${{ inputs.nezha_server }}" >> .env
+          echo "NEZHA_KEY=${{ inputs.nezha_key }}" >> .env
+          echo "TUIC_PORT=${{ inputs.tuic_port }}" >> .env
+          echo "TUIC_DOMAIN=${{ inputs.tuic_domain }}" >> .env
+          echo "TUIC_PASSWORD=${{ inputs.tuic_password }}" >> .env
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
