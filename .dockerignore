@@ -1,0 +1,6 @@
+.git
+.github
+README.md
+nexus-linux*
+*.exe
+# 极其重要：坚决不能把 .env 加到这里，因为 Dockerfile 里面需要 COPY .env
