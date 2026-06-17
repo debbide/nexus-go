@@ -52,9 +52,8 @@ on:
         required: false
         type: string
       tuic_port:
-        description: 'TUIC 监听端口 (默认 30018)'
+        description: 'TUIC 监听端口 (选填，留空则不开启 TUIC)'
         required: false
-        default: '30018'
         type: string
       tuic_domain:
         description: 'TUIC 自签证书域名 (选填)'

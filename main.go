@@ -84,9 +84,6 @@ func initEnv() {
 	}
 	NodeName = os.Getenv("NAME")
 	TUICPort = os.Getenv("TUIC_PORT")
-	if TUICPort == "" {
-		TUICPort = "30018"
-	}
 	TUICDomain = os.Getenv("TUIC_DOMAIN")
 	TUICPassword = os.Getenv("TUIC_PASSWORD")
 	if TUICPassword == "" {

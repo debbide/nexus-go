@@ -59,19 +59,69 @@ func startSingBoxRuntime() (*singBoxRuntime, error) {
 	}
 	singBoxVLESSListenPort = vlessPort
 
-	tuicPort, err := parseUint16Port(TUICPort)
-	if err != nil {
-		return nil, fmt.Errorf("invalid TUIC_PORT: %w", err)
-	}
-
-	certPEM, keyPEM, err := generateSelfSignedCertificate(resolveTUICServerName())
-	if err != nil {
-		return nil, fmt.Errorf("generate TUIC certificate: %w", err)
-	}
 
 	listenLocal := badoption.Addr(netip.MustParseAddr("127.0.0.1"))
 	listenAll := badoption.Addr(netip.IPv4Unspecified())
 	ctx := minimalSingBoxContext(context.Background())
+
+	inbounds := []option.Inbound{
+		{
+			Type: constant.TypeVLESS,
+			Tag:  "vless-ws-in",
+			Options: &option.VLESSInboundOptions{
+				ListenOptions: option.ListenOptions{
+					Listen:     &listenLocal,
+					ListenPort: singBoxVLESSListenPort,
+				},
+				Users: []option.VLESSUser{
+					{Name: singBoxTUICDefaultName, UUID: UUID},
+				},
+				Transport: &option.V2RayTransportOptions{
+					Type: constant.V2RayTransportTypeWebsocket,
+					WebsocketOptions: option.V2RayWebsocketOptions{
+						Path: singBoxVLESSPath(),
+					},
+				},
+			},
+		},
+	}
+
+	if TUICPort != "" && TUICPort != "0" {
+		tuicPort, err := parseUint16Port(TUICPort)
+		if err != nil {
+			return nil, fmt.Errorf("invalid TUIC_PORT: %w", err)
+		}
+
+		certPEM, keyPEM, err := generateSelfSignedCertificate(resolveTUICServerName())
+		if err != nil {
+			return nil, fmt.Errorf("generate TUIC certificate: %w", err)
+		}
+
+		inbounds = append(inbounds, option.Inbound{
+			Type: constant.TypeTUIC,
+			Tag:  "tuic-in",
+			Options: &option.TUICInboundOptions{
+				ListenOptions: option.ListenOptions{
+					Listen:     &listenAll,
+					ListenPort: tuicPort,
+				},
+				Users: []option.TUICUser{
+					{Name: singBoxTUICDefaultName, UUID: UUID, Password: TUICPassword},
+				},
+				CongestionControl: "bbr",
+				Heartbeat:         badoption.Duration(10 * time.Second),
+				InboundTLSOptionsContainer: option.InboundTLSOptionsContainer{
+					TLS: &option.InboundTLSOptions{
+						Enabled:     true,
+						ServerName:  resolveTUICServerName(),
+						ALPN:        badoption.Listable[string]{"h3"},
+						Certificate: badoption.Listable[string]{string(certPEM)},
+						Key:         badoption.Listable[string]{string(keyPEM)},
+					},
+				},
+			},
+		})
+	}
 
 	instance, err := box.New(box.Options{
 		Context: ctx,
@@ -80,51 +130,7 @@ func startSingBoxRuntime() (*singBoxRuntime, error) {
 				Disabled: !Debug,
 				Level:    singBoxLogLevel(),
 			},
-			Inbounds: []option.Inbound{
-				{
-					Type: constant.TypeVLESS,
-					Tag:  "vless-ws-in",
-					Options: &option.VLESSInboundOptions{
-						ListenOptions: option.ListenOptions{
-							Listen:     &listenLocal,
-							ListenPort: singBoxVLESSListenPort,
-						},
-						Users: []option.VLESSUser{
-							{Name: singBoxTUICDefaultName, UUID: UUID},
-						},
-						Transport: &option.V2RayTransportOptions{
-							Type: constant.V2RayTransportTypeWebsocket,
-							WebsocketOptions: option.V2RayWebsocketOptions{
-								Path: singBoxVLESSPath(),
-							},
-						},
-					},
-				},
-				{
-					Type: constant.TypeTUIC,
-					Tag:  "tuic-in",
-					Options: &option.TUICInboundOptions{
-						ListenOptions: option.ListenOptions{
-							Listen:     &listenAll,
-							ListenPort: tuicPort,
-						},
-						Users: []option.TUICUser{
-							{Name: singBoxTUICDefaultName, UUID: UUID, Password: TUICPassword},
-						},
-						CongestionControl: "bbr",
-						Heartbeat:         badoption.Duration(10 * time.Second),
-						InboundTLSOptionsContainer: option.InboundTLSOptionsContainer{
-							TLS: &option.InboundTLSOptions{
-								Enabled:     true,
-								ServerName:  resolveTUICServerName(),
-								ALPN:        badoption.Listable[string]{"h3"},
-								Certificate: badoption.Listable[string]{string(certPEM)},
-								Key:         badoption.Listable[string]{string(keyPEM)},
-							},
-						},
-					},
-				},
-			},
+			Inbounds: inbounds,
 			Outbounds: []option.Outbound{
 				{
 					Type: constant.TypeDirect,
@@ -147,7 +153,11 @@ func startSingBoxRuntime() (*singBoxRuntime, error) {
 		instance.Close()
 		return nil, err
 	}
-	log.Printf("[INFO] sing-box runtime started: vless-ws=127.0.0.1:%d%s tuic=0.0.0.0:%s", singBoxVLESSListenPort, singBoxVLESSPath(), TUICPort)
+	if TUICPort != "" && TUICPort != "0" {
+		log.Printf("[INFO] sing-box runtime started: vless-ws=127.0.0.1:%d%s tuic=0.0.0.0:%s", singBoxVLESSListenPort, singBoxVLESSPath(), TUICPort)
+	} else {
+		log.Printf("[INFO] sing-box runtime started: vless-ws=127.0.0.1:%d%s", singBoxVLESSListenPort, singBoxVLESSPath())
+	}
 	return &singBoxRuntime{instance: instance}, nil
 }
 
