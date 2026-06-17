@@ -174,9 +174,12 @@ func handleSubscription(w http.ResponseWriter, r *http.Request) {
 		"vless://%s@%s:%s?encryption=none&security=%s&sni=%s&fp=chrome&type=ws&host=%s&path=%%2F%s#%s",
 		UUID, currentDomain, currentPort, tlsParam, currentDomain, currentDomain, trimPath(WsPath), namePart+"-VLESS",
 	)
-	tuicURL := buildTUICURL(namePart + "-TUIC")
-
-	subscription := vlessURL + "\n" + tuicURL
+	subscription := vlessURL
+	if TUICPort != "" && TUICPort != "0" {
+		tuicURL := buildTUICURL(namePart + "-TUIC")
+		subscription += "\n" + tuicURL
+	}
+	
 	if CFDomain != "" {
 		cfNamePart := namePart + "-CF"
 		cfVlessURL := fmt.Sprintf(
