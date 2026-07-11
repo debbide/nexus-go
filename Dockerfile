@@ -16,7 +16,7 @@ RUN go mod download
 # Copy the source code
 COPY . .
 # Build the application statically
-RUN go build -ldflags="-s -w" -o nexus-go .
+RUN go build -tags with_quic -ldflags="-s -w" -o nexus-go .
 
 # Run stage
 FROM alpine:latest
