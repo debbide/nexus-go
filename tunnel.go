@@ -261,12 +261,15 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 		log.Printf("[TUNNEL] Conn[%d] registered successfully", connIndex)
 		// 保持 control stream 存活
 		for {
-			time.Sleep(15 * time.Second)
-			if _, err := w.Write([]byte{}); err != nil {
-				break
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(15 * time.Second):
+				if _, err := w.Write([]byte{}); err != nil {
+					return
+				}
 			}
 		}
-		return
 	}
 
 	localAddr := "127.0.0.1:" + PORT
@@ -348,8 +351,23 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 		}
 
 		// 双向数据桥接
-		go io.Copy(localConn, r.Body)
-		io.Copy(flushWriter{w: w}, br)
+		go func() {
+			io.Copy(localConn, r.Body)
+			if tcpConn, ok := localConn.(*net.TCPConn); ok {
+				tcpConn.CloseWrite()
+			}
+		}()
+
+		done := make(chan struct{})
+		go func() {
+			io.Copy(flushWriter{w: w}, br)
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-r.Context().Done():
+		}
 
 	} else {
 		// ---- 普通 HTTP 代理（主页、订阅等）----
