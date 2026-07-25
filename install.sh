@@ -384,6 +384,145 @@ uninstall_app() {
   exit 0
 }
 
+urlencode() {
+  # 最小 URL 编码，够节点链接参数用
+  if need_cmd python3; then
+    python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+  elif need_cmd python; then
+    python -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1" 2>/dev/null \
+      || python -c 'import urllib,sys; print(urllib.quote(sys.argv[1], safe=""))' "$1"
+  else
+    # 无 python 时原样输出（UUID/密码通常无需编码）
+    printf '%s' "$1"
+  fi
+}
+
+fetch_public_ip() {
+  if need_cmd curl; then
+    curl -fsS --connect-timeout 5 https://api-ipv4.ip.sb/ip 2>/dev/null | tr -d '[:space:]'
+  elif need_cmd wget; then
+    wget -qO- --timeout=5 https://api-ipv4.ip.sb/ip 2>/dev/null | tr -d '[:space:]'
+  fi
+}
+
+# 根据 .env 在终端打印各协议节点链接（方便只拷某一个）
+show_nodes() {
+  if [ ! -f "${APP_ENV}" ]; then
+    err "未找到配置文件: ${APP_ENV}"
+    err "请先安装，或确认路径正确。"
+    return 1
+  fi
+
+  # shellcheck disable=SC1090
+  set -a
+  . "${APP_ENV}"
+  set +a
+
+  local uuid port sub_path ws_path name
+  local tuic_port tuic_domain tuic_pass
+  local hy2_port hy2_domain hy2_pass hy2_obfs
+  local cf_domain public_ip host sni
+  local vless_url cf_vless_url tuic_url hy2_url sub_url
+  local enc_uuid enc_pass enc_name
+
+  uuid="${UUID:-}"
+  if [ -z "${uuid}" ]; then
+    err ".env 里没有 UUID，无法生成节点。"
+    return 1
+  fi
+
+  port="${PORT:-${SERVER_PORT:-${APP_PORT}}}"
+  sub_path="${SUB_PATH:-sub}"
+  sub_path="${sub_path#/}"
+  ws_path="${WSPATH:-}"
+  if [ -z "${ws_path}" ]; then
+    ws_path="${uuid:0:8}"
+  fi
+  ws_path="${ws_path#/}"
+  name="${NAME:-Nexus}"
+
+  tuic_port="${TUIC_PORT:-}"
+  tuic_domain="${TUIC_DOMAIN:-}"
+  tuic_pass="${TUIC_PASSWORD:-${uuid}}"
+
+  hy2_port="${HY2_PORT:-}"
+  hy2_domain="${HY2_DOMAIN:-${TUIC_DOMAIN:-}}"
+  hy2_pass="${HY2_PASSWORD:-${uuid}}"
+  hy2_obfs="${HY2_OBFS_PASSWORD:-}"
+
+  cf_domain="${CF_DOMAIN:-}"
+  public_ip="$(fetch_public_ip || true)"
+  if [ -z "${public_ip}" ]; then
+    public_ip="YOUR_SERVER_IP"
+    warn "无法自动获取公网 IP，直连节点请把 YOUR_SERVER_IP 换成实际 IP。"
+  fi
+
+  printf "\n%b\n" "${GREEN}======== Nexus 节点链接 ========${NC}"
+  info "配置: ${APP_ENV}"
+  info "本机 Web 端口: ${port}  |  订阅路径: /${sub_path}  |  WSPATH: /${ws_path}"
+  echo
+
+  # --- VLESS 直连（IP:PORT，无 TLS）---
+  printf "%b\n" "${YELLOW}[1] VLESS-WS 直连（IP，不经 CF）${NC}"
+  vless_url="vless://${uuid}@${public_ip}:${port}?encryption=none&security=none&type=ws&host=${public_ip}&path=%2F${ws_path}#${name}-VLESS"
+  printf "%s\n\n" "${vless_url}"
+
+  # --- VLESS via CF ---
+  if [ -n "${cf_domain}" ]; then
+    printf "%b\n" "${YELLOW}[2] VLESS-WS + CF 域名（推荐走隧道/CDN）${NC}"
+    cf_vless_url="vless://${uuid}@${cf_domain}:443?encryption=none&security=tls&sni=${cf_domain}&fp=chrome&type=ws&host=${cf_domain}&path=%2F${ws_path}#${name}-CF-VLESS"
+    printf "%s\n\n" "${cf_vless_url}"
+
+    printf "%b\n" "${YELLOW}[订阅地址]（客户端一键导入）${NC}"
+    sub_url="https://${cf_domain}/${sub_path}"
+    printf "%s\n\n" "${sub_url}"
+  else
+    info "[2] 未配置 CF_DOMAIN，跳过 CF 节点 / HTTPS 订阅地址"
+    if [ -n "${public_ip}" ] && [ "${public_ip}" != "YOUR_SERVER_IP" ]; then
+      printf "%b\n" "${YELLOW}[本地订阅]（仅本机/IP 可访问时）${NC}"
+      printf "http://%s:%s/%s\n\n" "${public_ip}" "${port}" "${sub_path}"
+    fi
+  fi
+
+  # --- TUIC ---
+  if [ -n "${tuic_port}" ] && [ "${tuic_port}" != "0" ]; then
+    host="${tuic_domain:-${public_ip}}"
+    sni="${host}"
+    enc_uuid="$(urlencode "${uuid}")"
+    enc_pass="$(urlencode "${tuic_pass}")"
+    enc_name="$(urlencode "${name}-TUIC")"
+    printf "%b\n" "${YELLOW}[3] TUIC（UDP 直连，不经 CF）${NC}"
+    tuic_url="tuic://${enc_uuid}:${enc_pass}@${host}:${tuic_port}?allow_insecure=1&alpn=h3&congestion_control=bbr&insecure=1&skip-cert-verify=true&sni=${sni}&udp_relay_mode=native&version=5#${enc_name}"
+    printf "%s\n\n" "${tuic_url}"
+  else
+    info "[3] 未开启 TUIC（TUIC_PORT 为空）"
+    echo
+  fi
+
+  # --- HY2 ---
+  if [ -n "${hy2_port}" ] && [ "${hy2_port}" != "0" ]; then
+    host="${hy2_domain:-${public_ip}}"
+    sni="${host}"
+    enc_pass="$(urlencode "${hy2_pass}")"
+    enc_name="$(urlencode "${name}-HY2")"
+    printf "%b\n" "${YELLOW}[4] Hysteria2 / hy2（UDP 直连，不经 CF）${NC}"
+    hy2_url="hysteria2://${enc_pass}@${host}:${hy2_port}?insecure=1&sni=${sni}&alpn=h3"
+    if [ -n "${hy2_obfs}" ]; then
+      hy2_url="${hy2_url}&obfs=salamander&obfs-password=$(urlencode "${hy2_obfs}")"
+    fi
+    hy2_url="${hy2_url}#${enc_name}"
+    printf "%s\n\n" "${hy2_url}"
+  else
+    info "[4] 未开启 HY2（HY2_PORT 为空）"
+    echo
+  fi
+
+  printf "%b\n" "${GREEN}================================${NC}"
+  info "提示: 只想用某一个协议时，复制对应那一行即可。"
+  info "再次查看: bash install.sh nodes   或菜单选 3"
+  echo
+}
+
 run_install() {
   # 先停旧服务，避免 pick_port 把“自己占用的端口”当成冲突而换端口
   if [ "$(id -u)" = "0" ]; then
@@ -402,21 +541,27 @@ run_install() {
   setup_service
   say "🎉 部署大功告成！程序本体存放在 ${BASE_DIR} 目录。"
   info "  当前 init 系统: $(detect_init)"
+  # 装完直接打节点，方便复制
+  sleep 1
+  show_nodes || true
 }
 
 show_menu() {
   printf "\n%b\n" "${GREEN} Nexus (VPS 实体常驻版) 一键管理脚本 [系统自适应] ${NC}"
   printf "  ${YELLOW}1.${NC} 安装 / 启动服务 (自动适配 systemd / OpenRC)\n"
   printf "  ${YELLOW}2.${NC} 完全卸载节点\n"
+  printf "  ${YELLOW}3.${NC} 打印节点链接 (VLESS / CF / TUIC / HY2)\n"
   printf "  ${YELLOW}0.${NC} 退出脚本\n"
-  printf "请输入数字 [0-2]: "; read -r choice </dev/tty
+  printf "请输入数字 [0-3]: "; read -r choice </dev/tty
   case "${choice}" in
     1) run_install ;;
     2) uninstall_app ;;
+    3) show_nodes ;;
     *) exit 0 ;;
   esac
 }
 
 if [ "${1:-}" = "uninstall" ]; then uninstall_app
 elif [ "${1:-}" = "install" ]; then run_install
+elif [ "${1:-}" = "nodes" ] || [ "${1:-}" = "show" ]; then show_nodes
 else show_menu; fi
