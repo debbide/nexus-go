@@ -62,7 +62,9 @@ func startSingBoxRuntime() (*singBoxRuntime, error) {
 
 
 	listenLocal := badoption.Addr(netip.MustParseAddr("127.0.0.1"))
-	listenAll := badoption.Addr(netip.IPv4Unspecified())
+	// :: 在 Linux 上通常为双栈（v4-mapped + v6），便于 TUIC/HY2 同时走 v4/v6
+	// 若系统开启 net.ipv6.bindv6only=1，则仅 IPv6，需再另开 IPv4 监听
+	listenDual := badoption.Addr(netip.IPv6Unspecified())
 	ctx := minimalSingBoxContext(context.Background())
 
 	inbounds := []option.Inbound{
@@ -103,7 +105,7 @@ func startSingBoxRuntime() (*singBoxRuntime, error) {
 			Tag:  "tuic-in",
 			Options: &option.TUICInboundOptions{
 				ListenOptions: option.ListenOptions{
-					Listen:     &listenAll,
+					Listen:     &listenDual,
 					ListenPort: tuicPort,
 				},
 				Users: []option.TUICUser{
@@ -137,7 +139,8 @@ func startSingBoxRuntime() (*singBoxRuntime, error) {
 
 		hy2Opts := &option.Hysteria2InboundOptions{
 			ListenOptions: option.ListenOptions{
-				Listen:     &listenAll,
+				// 双栈：IPv6 全接口，系统默认下同时接受 IPv4
+				Listen:     &listenDual,
 				ListenPort: hy2Port,
 			},
 			Users: []option.Hysteria2User{
@@ -199,10 +202,10 @@ func startSingBoxRuntime() (*singBoxRuntime, error) {
 	}
 	parts := []string{fmt.Sprintf("vless-ws=127.0.0.1:%d%s", singBoxVLESSListenPort, singBoxVLESSPath())}
 	if TUICPort != "" && TUICPort != "0" {
-		parts = append(parts, "tuic=0.0.0.0:"+TUICPort)
+		parts = append(parts, "tuic=[::]:"+TUICPort+"(dual-stack)")
 	}
 	if HY2Port != "" && HY2Port != "0" {
-		parts = append(parts, "hy2=0.0.0.0:"+HY2Port)
+		parts = append(parts, "hy2=[::]:"+HY2Port+"(dual-stack)")
 	}
 	log.Printf("[INFO] sing-box runtime started: %s", strings.Join(parts, " "))
 	return &singBoxRuntime{instance: instance}, nil
