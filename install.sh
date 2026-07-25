@@ -83,74 +83,111 @@ pick_port() {
   done
 }
 
-ask_config() {
-  if [ -n "${ENV_UUID:-}" ] || [ -n "${NON_INTERACTIVE:-}" ]; then
-      say "检测到环境变量预设，跳过互动问答！"
-      return
-  fi
-
-  # 1. 尝试读取旧的配置文件作为默认值，方便日后一键更新不重填
+# 把已有 .env / 环境变量灌进 ENV_*，供 create_env_file 使用
+load_env_defaults() {
   if [ -f "${APP_ENV}" ]; then
     say "检测到已有配置文件，读取旧配置作为预设..."
     # shellcheck disable=SC1090
-    source "${APP_ENV}"
+    set -a
+    . "${APP_ENV}"
+    set +a
+  fi
+
+  ENV_UUID="${ENV_UUID:-${UUID:-}}"
+  ENV_NEZHA_SERVER="${ENV_NEZHA_SERVER:-${NEZHA_SERVER:-}}"
+  ENV_NEZHA_PORT="${ENV_NEZHA_PORT:-${NEZHA_PORT:-}}"
+  ENV_NEZHA_KEY="${ENV_NEZHA_KEY:-${NEZHA_KEY:-}}"
+  ENV_NEZHA_DOH="${ENV_NEZHA_DOH:-${NEZHA_DOH:-}}"
+  ENV_CF_TUNNEL_TOKEN="${ENV_CF_TUNNEL_TOKEN:-${CF_TUNNEL_TOKEN:-}}"
+  ENV_CF_DOMAIN="${ENV_CF_DOMAIN:-${CF_DOMAIN:-}}"
+  ENV_SUB_PATH="${ENV_SUB_PATH:-${SUB_PATH:-}}"
+  ENV_WSPATH="${ENV_WSPATH:-${WSPATH:-}}"
+  ENV_TUIC_PORT="${ENV_TUIC_PORT:-${TUIC_PORT:-}}"
+  ENV_HY2_PORT="${ENV_HY2_PORT:-${HY2_PORT:-}}"
+  ENV_HY2_DOMAIN="${ENV_HY2_DOMAIN:-${HY2_DOMAIN:-}}"
+  ENV_HY2_OBFS_PASSWORD="${ENV_HY2_OBFS_PASSWORD:-${HY2_OBFS_PASSWORD:-}}"
+  ENV_DEBUG="${ENV_DEBUG:-${DEBUG:-true}}"
+
+  # 重装时尽量沿用旧 PORT，避免无意义换端口
+  if [ -n "${PORT:-}" ]; then
+    APP_PORT="${PORT}"
+  elif [ -n "${SERVER_PORT:-}" ]; then
+    APP_PORT="${SERVER_PORT}"
+  fi
+}
+
+ask_config() {
+  load_env_defaults
+
+  # 非交互：直接沿用旧配置 / 外部预设的 ENV_*，不再提问
+  if [ -n "${ENV_UUID:-}" ] && [ -n "${NON_INTERACTIVE:-}" ]; then
+      say "检测到环境变量预设/非交互模式，跳过互动问答，沿用已有配置。"
+      return
+  fi
+  if [ -n "${NON_INTERACTIVE:-}" ]; then
+      say "非交互模式：使用已有配置（若有）。"
+      return
   fi
 
   printf "\n%b\n" "${YELLOW}=== 请配置 VPS 节点环境变量 (回车使用括号内的默认值) ===${NC}"
 
-  printf "1.  UUID (核心凭证) [%s]: " "${UUID:-}"
+  printf "1.  UUID (核心凭证) [%s]: " "${ENV_UUID:-}"
   read -r input </dev/tty
-  ENV_UUID="${input:-${UUID:-}}"
+  ENV_UUID="${input:-${ENV_UUID:-}}"
 
-  printf "2.  NEZHA_SERVER (哪吒域名/IP) [%s]: " "${NEZHA_SERVER:-}"
+  printf "2.  NEZHA_SERVER (哪吒域名/IP) [%s]: " "${ENV_NEZHA_SERVER:-}"
   read -r input </dev/tty
-  ENV_NEZHA_SERVER="${input:-${NEZHA_SERVER:-}}"
+  ENV_NEZHA_SERVER="${input:-${ENV_NEZHA_SERVER:-}}"
 
-  printf "3.  NEZHA_PORT (v0面板填5555, v1留空) [%s]: " "${NEZHA_PORT:-}"
+  printf "3.  NEZHA_PORT (v0面板填5555, v1留空) [%s]: " "${ENV_NEZHA_PORT:-}"
   read -r input </dev/tty
-  ENV_NEZHA_PORT="${input:-${NEZHA_PORT:-}}"
+  ENV_NEZHA_PORT="${input:-${ENV_NEZHA_PORT:-}}"
 
-  printf "4.  NEZHA_KEY (哪吒密钥) [%s]: " "${NEZHA_KEY:-}"
+  printf "4.  NEZHA_KEY (哪吒密钥) [%s]: " "${ENV_NEZHA_KEY:-}"
   read -r input </dev/tty
-  ENV_NEZHA_KEY="${input:-${NEZHA_KEY:-}}"
+  ENV_NEZHA_KEY="${input:-${ENV_NEZHA_KEY:-}}"
 
-  printf "5.  NEZHA_DOH (安全DNS，如 1.1.1.1/dns-query) [%s]: " "${NEZHA_DOH:-}"
+  printf "5.  NEZHA_DOH (安全DNS，如 1.1.1.1/dns-query) [%s]: " "${ENV_NEZHA_DOH:-}"
   read -r input </dev/tty
-  ENV_NEZHA_DOH="${input:-${NEZHA_DOH:-}}"
+  ENV_NEZHA_DOH="${input:-${ENV_NEZHA_DOH:-}}"
 
-  printf "6.  CF_TUNNEL_TOKEN (隧道Token) [%s]: " "${CF_TUNNEL_TOKEN:-}"
+  printf "6.  CF_TUNNEL_TOKEN (隧道Token) [%s]: " "${ENV_CF_TUNNEL_TOKEN:-}"
   read -r input </dev/tty
-  ENV_CF_TUNNEL_TOKEN="${input:-${CF_TUNNEL_TOKEN:-}}"
+  ENV_CF_TUNNEL_TOKEN="${input:-${ENV_CF_TUNNEL_TOKEN:-}}"
 
-  printf "7.  CF_DOMAIN (自定义域名) [%s]: " "${CF_DOMAIN:-}"
+  printf "7.  CF_DOMAIN (自定义域名) [%s]: " "${ENV_CF_DOMAIN:-}"
   read -r input </dev/tty
-  ENV_CF_DOMAIN="${input:-${CF_DOMAIN:-}}"
+  ENV_CF_DOMAIN="${input:-${ENV_CF_DOMAIN:-}}"
 
-  printf "8.  SUB_PATH (订阅路径) [%s]: " "${SUB_PATH:-}"
+  printf "8.  SUB_PATH (订阅路径) [%s]: " "${ENV_SUB_PATH:-}"
   read -r input </dev/tty
-  ENV_SUB_PATH="${input:-${SUB_PATH:-}}"
+  ENV_SUB_PATH="${input:-${ENV_SUB_PATH:-}}"
 
-  printf "9.  WSPATH (VLESS路径，留空取UUID前8位) [%s]: " "${WSPATH:-}"
+  printf "9.  WSPATH (VLESS路径，留空取UUID前8位) [%s]: " "${ENV_WSPATH:-}"
   read -r input </dev/tty
-  ENV_WSPATH="${input:-${WSPATH:-}}"
+  ENV_WSPATH="${input:-${ENV_WSPATH:-}}"
 
   # 明确告诉用户留空就是禁用
-  printf "10. TUIC_PORT (TUIC端口，输入具体数字开启，留空禁用) [%s]: " "${TUIC_PORT:-}"
+  printf "10. TUIC_PORT (TUIC端口，输入具体数字开启，留空禁用) [%s]: " "${ENV_TUIC_PORT:-}"
   read -r input </dev/tty
-  ENV_TUIC_PORT="${input:-${TUIC_PORT:-}}"
+  ENV_TUIC_PORT="${input:-${ENV_TUIC_PORT:-}}"
 
-  printf "11. HY2_PORT (Hysteria2端口，输入具体数字开启，留空禁用) [%s]: " "${HY2_PORT:-}"
+  printf "11. HY2_PORT (Hysteria2端口，输入具体数字开启，留空禁用) [%s]: " "${ENV_HY2_PORT:-}"
   read -r input </dev/tty
-  ENV_HY2_PORT="${input:-${HY2_PORT:-}}"
+  ENV_HY2_PORT="${input:-${ENV_HY2_PORT:-}}"
 
-  printf "12. HY2_OBFS_PASSWORD (HY2混淆密码，留空不启用salamander) [%s]: " "${HY2_OBFS_PASSWORD:-}"
+  printf "12. HY2_DOMAIN (HY2证书/SNI域名，留空用IP) [%s]: " "${ENV_HY2_DOMAIN:-}"
   read -r input </dev/tty
-  ENV_HY2_OBFS_PASSWORD="${input:-${HY2_OBFS_PASSWORD:-}}"
+  ENV_HY2_DOMAIN="${input:-${ENV_HY2_DOMAIN:-}}"
+
+  printf "13. HY2_OBFS_PASSWORD (HY2混淆密码，留空不启用salamander) [%s]: " "${ENV_HY2_OBFS_PASSWORD:-}"
+  read -r input </dev/tty
+  ENV_HY2_OBFS_PASSWORD="${input:-${ENV_HY2_OBFS_PASSWORD:-}}"
 
   # DEBUG 日志开关：默认开启，方便出问题时排查
-  printf "13. DEBUG (是否记录运行日志，出问题好排查) [%s]: " "${DEBUG:-true}"
+  printf "14. DEBUG (是否记录运行日志，出问题好排查) [%s]: " "${ENV_DEBUG:-true}"
   read -r input </dev/tty
-  ENV_DEBUG="${input:-${DEBUG:-true}}"
+  ENV_DEBUG="${input:-${ENV_DEBUG:-true}}"
 
   printf "%b\n\n" "${YELLOW}======================================================${NC}"
 }
@@ -185,6 +222,7 @@ SUB_PATH=${ENV_SUB_PATH:-}
 WSPATH=${ENV_WSPATH:-}
 TUIC_PORT=${ENV_TUIC_PORT:-}
 HY2_PORT=${ENV_HY2_PORT:-}
+HY2_DOMAIN=${ENV_HY2_DOMAIN:-}
 HY2_OBFS_PASSWORD=${ENV_HY2_OBFS_PASSWORD:-}
 DEBUG=${ENV_DEBUG:-true}
 EOF
@@ -347,6 +385,13 @@ uninstall_app() {
 }
 
 run_install() {
+  # 先停旧服务，避免 pick_port 把“自己占用的端口”当成冲突而换端口
+  if [ "$(id -u)" = "0" ]; then
+    case "$(detect_init)" in
+      systemd) systemctl stop "${APP_NAME}" >/dev/null 2>&1 || true ;;
+      openrc)  rc-service "${APP_NAME}" stop >/dev/null 2>&1 || true ;;
+    esac
+  fi
   pkill -9 -f "${APP_BIN}" >/dev/null 2>&1 || true
   mkdir -p "${BASE_DIR}" "${LOG_DIR}"
   ask_config
