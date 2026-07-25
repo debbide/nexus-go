@@ -29,9 +29,12 @@ Nexus-Go 是一个轻量级的后端服务程序。本项目集成了基础网�
 | `HY2_DOMAIN` | HY2 自签 TLS 证书的域名 / 订阅 host | 优先 `HY2_DOMAIN`，否则复用 `TUIC_DOMAIN` / 公网IPv4 |
 | `HY2_PASSWORD` | HY2 认证密码 | 同 `UUID` |
 | `HY2_OBFS_PASSWORD` | HY2 salamander 混淆密码，留空不启用混淆 | 无 |
+| `UDP_IPV6_ONLY` | `true` 时 TUIC/HY2 **仅监听本机全局 IPv6**（真·v6 only，IPv4 连不上）；`false` 为 `[::]` **双栈** | `false` |
 
-> **TUIC / HY2 监听**：绑定 `[::]`，在常见 Linux 默认配置下为**双栈**（IPv4 + IPv6 均可连）。  
-> 若只要 v6：域名只加 **AAAA**；只要 v4：只加 **A** 或直接用 IP。不要把 UDP 域名套 Cloudflare 橙色云。
+> **TUIC / HY2 监听**  
+> - 默认 `UDP_IPV6_ONLY=false`：绑 `[::]`，常见 Linux 下为**双栈**。  
+> - `UDP_IPV6_ONLY=true`：绑本机全局 IPv6 地址，**服务端拒绝 IPv4**；无全局 IPv6 时启动失败。  
+> - 客户端侧也可用域名只加 AAAA / 只加 A 控制解析；不要把 UDP 域名套 Cloudflare 橙色云。
 
 ### 辅助功能 (可选)
 | 变量名 | 说明 | 默认值 |

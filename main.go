@@ -35,6 +35,8 @@ var (
 	HY2Domain    string
 	HY2Password  string
 	HY2ObfsPass  string
+	// UDPIPv6Only=true 时 TUIC/HY2 仅监听本机全局 IPv6（真·v6 only）；false 为 [::] 双栈
+	UDPIPv6Only bool
 
 	AutoAccess                 bool
 	NezhaTLS                   bool
@@ -100,6 +102,10 @@ func initEnv() {
 		HY2Password = UUID
 	}
 	HY2ObfsPass = os.Getenv("HY2_OBFS_PASSWORD")
+	// 兼容 UDP_IPV6_ONLY / HY2_IPV6_ONLY / TUIC_IPV6_ONLY
+	UDPIPv6Only = envBool("UDP_IPV6_ONLY", false) ||
+		envBool("HY2_IPV6_ONLY", false) ||
+		envBool("TUIC_IPV6_ONLY", false)
 	Debug = envBool("DEBUG", false)
 
 	target := resolveNezhaTarget(NezhaServer, NezhaPort)

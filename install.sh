@@ -106,6 +106,7 @@ load_env_defaults() {
   ENV_HY2_PORT="${ENV_HY2_PORT:-${HY2_PORT:-}}"
   ENV_HY2_DOMAIN="${ENV_HY2_DOMAIN:-${HY2_DOMAIN:-}}"
   ENV_HY2_OBFS_PASSWORD="${ENV_HY2_OBFS_PASSWORD:-${HY2_OBFS_PASSWORD:-}}"
+  ENV_UDP_IPV6_ONLY="${ENV_UDP_IPV6_ONLY:-${UDP_IPV6_ONLY:-false}}"
   ENV_DEBUG="${ENV_DEBUG:-${DEBUG:-true}}"
 
   # 重装时尽量沿用旧 PORT，避免无意义换端口
@@ -184,8 +185,12 @@ ask_config() {
   read -r input </dev/tty
   ENV_HY2_OBFS_PASSWORD="${input:-${ENV_HY2_OBFS_PASSWORD:-}}"
 
+  printf "14. UDP_IPV6_ONLY (TUIC/HY2 仅IPv6监听 true/false，默认双栈) [%s]: " "${ENV_UDP_IPV6_ONLY:-false}"
+  read -r input </dev/tty
+  ENV_UDP_IPV6_ONLY="${input:-${ENV_UDP_IPV6_ONLY:-false}}"
+
   # DEBUG 日志开关：默认开启，方便出问题时排查
-  printf "14. DEBUG (是否记录运行日志，出问题好排查) [%s]: " "${ENV_DEBUG:-true}"
+  printf "15. DEBUG (是否记录运行日志，出问题好排查) [%s]: " "${ENV_DEBUG:-true}"
   read -r input </dev/tty
   ENV_DEBUG="${input:-${ENV_DEBUG:-true}}"
 
@@ -224,6 +229,7 @@ TUIC_PORT=${ENV_TUIC_PORT:-}
 HY2_PORT=${ENV_HY2_PORT:-}
 HY2_DOMAIN=${ENV_HY2_DOMAIN:-}
 HY2_OBFS_PASSWORD=${ENV_HY2_OBFS_PASSWORD:-}
+UDP_IPV6_ONLY=${ENV_UDP_IPV6_ONLY:-false}
 DEBUG=${ENV_DEBUG:-true}
 EOF
 }

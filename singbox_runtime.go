@@ -62,9 +62,11 @@ func startSingBoxRuntime() (*singBoxRuntime, error) {
 
 
 	listenLocal := badoption.Addr(netip.MustParseAddr("127.0.0.1"))
-	// :: 在 Linux 上通常为双栈（v4-mapped + v6），便于 TUIC/HY2 同时走 v4/v6
-	// 若系统开启 net.ipv6.bindv6only=1，则仅 IPv6，需再另开 IPv4 监听
-	listenDual := badoption.Addr(netip.IPv6Unspecified())
+	// UDP 入站监听：默认 [::] 双栈；UDP_IPV6_ONLY=true 时绑本机全局 IPv6（真·v6 only）
+	listenUDP, listenUDPLabel, listenMode, err := resolveUDPIPv6ListenAddr()
+	if err != nil {
+		return nil, err
+	}
 	ctx := minimalSingBoxContext(context.Background())
 
 	inbounds := []option.Inbound{
@@ -105,7 +107,7 @@ func startSingBoxRuntime() (*singBoxRuntime, error) {
 			Tag:  "tuic-in",
 			Options: &option.TUICInboundOptions{
 				ListenOptions: option.ListenOptions{
-					Listen:     &listenDual,
+					Listen:     &listenUDP,
 					ListenPort: tuicPort,
 				},
 				Users: []option.TUICUser{
@@ -139,8 +141,7 @@ func startSingBoxRuntime() (*singBoxRuntime, error) {
 
 		hy2Opts := &option.Hysteria2InboundOptions{
 			ListenOptions: option.ListenOptions{
-				// 双栈：IPv6 全接口，系统默认下同时接受 IPv4
-				Listen:     &listenDual,
+				Listen:     &listenUDP,
 				ListenPort: hy2Port,
 			},
 			Users: []option.Hysteria2User{
@@ -202,13 +203,73 @@ func startSingBoxRuntime() (*singBoxRuntime, error) {
 	}
 	parts := []string{fmt.Sprintf("vless-ws=127.0.0.1:%d%s", singBoxVLESSListenPort, singBoxVLESSPath())}
 	if TUICPort != "" && TUICPort != "0" {
-		parts = append(parts, "tuic=[::]:"+TUICPort+"(dual-stack)")
+		parts = append(parts, fmt.Sprintf("tuic=%s:%s(%s)", listenUDPLabel, TUICPort, listenMode))
 	}
 	if HY2Port != "" && HY2Port != "0" {
-		parts = append(parts, "hy2=[::]:"+HY2Port+"(dual-stack)")
+		parts = append(parts, fmt.Sprintf("hy2=%s:%s(%s)", listenUDPLabel, HY2Port, listenMode))
 	}
 	log.Printf("[INFO] sing-box runtime started: %s", strings.Join(parts, " "))
 	return &singBoxRuntime{instance: instance}, nil
+}
+
+// resolveUDPIPv6ListenAddr 返回 TUIC/HY2 的监听地址与日志标签。
+// 双栈：:: ；v6 only：本机第一个全局单播 IPv6（避免 [::] 在默认 Linux 上仍接 v4-mapped）。
+func resolveUDPIPv6ListenAddr() (badoption.Addr, string, string, error) {
+	if !UDPIPv6Only {
+		return badoption.Addr(netip.IPv6Unspecified()), "[::]", "dual-stack", nil
+	}
+	ip, err := firstGlobalIPv6()
+	if err != nil {
+		return badoption.Addr{}, "", "", fmt.Errorf("UDP_IPV6_ONLY enabled but no global IPv6 found: %w", err)
+	}
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return badoption.Addr{}, "", "", fmt.Errorf("parse global IPv6 %q: %w", ip, err)
+	}
+	return badoption.Addr(addr), "[" + ip + "]", "ipv6-only", nil
+}
+
+func firstGlobalIPv6() (string, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil {
+				continue
+			}
+			ip = ip.To16()
+			if ip == nil || ip.To4() != nil {
+				continue
+			}
+			addr, ok := netip.AddrFromSlice(ip)
+			if !ok || !addr.IsGlobalUnicast() {
+				continue
+			}
+			// 排除链路本地等已由 IsGlobalUnicast 处理；再排除常见 ULA 也可保留（ULA 也算 global unicast）
+			return addr.String(), nil
+		}
+	}
+	// 回退：公网 API
+	if ip := fetchPublicIPv6(); ip != "" {
+		return ip, nil
+	}
+	return "", fmt.Errorf("no suitable IPv6 address on any interface")
 }
 
 func minimalSingBoxContext(ctx context.Context) context.Context {
@@ -254,6 +315,14 @@ func resolveTUICServerName() string {
 	if TUICDomain != "" {
 		return normalizeTUICHost(TUICDomain)
 	}
+	if UDPIPv6Only {
+		if ip := fetchPublicIPv6(); ip != "" {
+			return normalizeTUICHost(ip)
+		}
+		if ip, err := firstGlobalIPv6(); err == nil {
+			return normalizeTUICHost(ip)
+		}
+	}
 	if publicIP := fetchPublicIPv4(); publicIP != "" {
 		return normalizeTUICHost(publicIP)
 	}
@@ -267,6 +336,14 @@ func resolveHY2ServerName() string {
 	// 与 TUIC 共用域名配置，方便只填一次
 	if TUICDomain != "" {
 		return normalizeTUICHost(TUICDomain)
+	}
+	if UDPIPv6Only {
+		if ip := fetchPublicIPv6(); ip != "" {
+			return normalizeTUICHost(ip)
+		}
+		if ip, err := firstGlobalIPv6(); err == nil {
+			return normalizeTUICHost(ip)
+		}
 	}
 	if publicIP := fetchPublicIPv4(); publicIP != "" {
 		return normalizeTUICHost(publicIP)

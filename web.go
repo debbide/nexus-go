@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -160,6 +161,46 @@ func fetchPublicIPv4() string {
 	return strings.TrimSpace(string(body))
 }
 
+func fetchPublicIPv6() string {
+	client := &http.Client{Timeout: 5 * time.Second}
+	// 多个源兜底
+	for _, u := range []string{
+		"https://api-ipv6.ip.sb/ip",
+		"https://api6.ipify.org",
+		"https://v6.ident.me",
+	} {
+		resp, err := client.Get(u)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil || resp.StatusCode != http.StatusOK {
+			continue
+		}
+		ip := strings.TrimSpace(string(body))
+		if net.ParseIP(ip) != nil && strings.Contains(ip, ":") {
+			return ip
+		}
+	}
+	return ""
+}
+
+// formatURIHost 把 IPv6 收成 [addr]，域名/IPv4 原样，用于 URI host 段
+func formatURIHost(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return host
+	}
+	if strings.HasPrefix(host, "[") {
+		return host
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		return "[" + host + "]"
+	}
+	return host
+}
+
 func handleSubscription(w http.ResponseWriter, r *http.Request) {
 	initCurrentISP()
 	initCurrentDomain()
@@ -214,7 +255,7 @@ func buildTUICURL(name string) string {
 		"tuic://%s:%s@%s:%s?%s#%s",
 		url.QueryEscape(UUID),
 		url.QueryEscape(TUICPassword),
-		host,
+		formatURIHost(host),
 		TUICPort,
 		query,
 		url.QueryEscape(name),
@@ -235,7 +276,7 @@ func buildHY2URL(name string) string {
 	return fmt.Sprintf(
 		"hysteria2://%s@%s:%s?%s#%s",
 		url.QueryEscape(HY2Password),
-		host,
+		formatURIHost(host),
 		HY2Port,
 		query.Encode(),
 		url.QueryEscape(name),
