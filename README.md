@@ -4,7 +4,7 @@ Nexus-Go 是一个轻量级的后端服务程序。本项目集成了基础网�
 
 ## 功能介绍
 - **静态编译**：使用 `CGO_ENABLED=0` 编译，无系统库依赖，兼容 Alpine 等极简环境。
-- **代理协议**：引入 Sing-box 核心库，支持 `VLESS-WS` 与 `TUIC` 协议直连。
+- **代理协议**：引入 Sing-box 核心库，支持 `VLESS-WS`、`TUIC` 与 `Hysteria2 (hy2)` 协议直连。
 - **网络优化**：针对 Cloudflare Tunnel 增加了 `TCP Keep-Alive` 和 `HTTP/2 ReadIdleTimeout`，优化在网络波动环境下的假死重连问题。
 - **日志控制**：生产环境中默认丢弃标准输出，降低运行内存开销。
 
@@ -22,9 +22,13 @@ Nexus-Go 是一个轻量级的后端服务程序。本项目集成了基础网�
 | 变量名 | 说明 | 默认值 |
 | :--- | :--- | :--- |
 | `WSPATH` | VLESS-WS 连接路径 | 取 UUID 前 8 位 |
-| `TUIC_PORT` | TUIC 监听端口 (UDP) | `30018` |
+| `TUIC_PORT` | TUIC 监听端口 (UDP)，留空禁用 | 无 |
 | `TUIC_DOMAIN` | TUIC 自签 TLS 证书的域名 | 自动获取IP或 `nexus.local` |
 | `TUIC_PASSWORD` | TUIC 连接密码 | 同 `UUID` |
+| `HY2_PORT` | Hysteria2 监听端口 (UDP)，留空禁用 | 无 |
+| `HY2_DOMAIN` | HY2 自签 TLS 证书的域名 | 优先 `HY2_DOMAIN`，否则复用 `TUIC_DOMAIN` / 公网IP |
+| `HY2_PASSWORD` | HY2 认证密码 | 同 `UUID` |
+| `HY2_OBFS_PASSWORD` | HY2 salamander 混淆密码，留空不启用混淆 | 无 |
 
 ### 辅助功能 (可选)
 | 变量名 | 说明 | 默认值 |

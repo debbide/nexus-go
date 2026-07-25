@@ -31,6 +31,10 @@ var (
 	TUICPort     string
 	TUICDomain   string
 	TUICPassword string
+	HY2Port      string
+	HY2Domain    string
+	HY2Password  string
+	HY2ObfsPass  string
 
 	AutoAccess                 bool
 	NezhaTLS                   bool
@@ -89,6 +93,13 @@ func initEnv() {
 	if TUICPassword == "" {
 		TUICPassword = UUID
 	}
+	HY2Port = os.Getenv("HY2_PORT")
+	HY2Domain = os.Getenv("HY2_DOMAIN")
+	HY2Password = os.Getenv("HY2_PASSWORD")
+	if HY2Password == "" {
+		HY2Password = UUID
+	}
+	HY2ObfsPass = os.Getenv("HY2_OBFS_PASSWORD")
 	Debug = envBool("DEBUG", false)
 
 	target := resolveNezhaTarget(NezhaServer, NezhaPort)

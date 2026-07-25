@@ -179,7 +179,11 @@ func handleSubscription(w http.ResponseWriter, r *http.Request) {
 		tuicURL := buildTUICURL(namePart + "-TUIC")
 		subscription += "\n" + tuicURL
 	}
-	
+	if HY2Port != "" && HY2Port != "0" {
+		hy2URL := buildHY2URL(namePart + "-HY2")
+		subscription += "\n" + hy2URL
+	}
+
 	if CFDomain != "" {
 		cfNamePart := namePart + "-CF"
 		cfVlessURL := fmt.Sprintf(
@@ -213,6 +217,27 @@ func buildTUICURL(name string) string {
 		host,
 		TUICPort,
 		query,
+		url.QueryEscape(name),
+	)
+}
+
+func buildHY2URL(name string) string {
+	host := resolveHY2ServerName()
+	query := url.Values{
+		"insecure": {"1"},
+		"sni":      {host},
+		"alpn":     {"h3"},
+	}
+	if HY2ObfsPass != "" {
+		query.Set("obfs", "salamander")
+		query.Set("obfs-password", HY2ObfsPass)
+	}
+	return fmt.Sprintf(
+		"hysteria2://%s@%s:%s?%s#%s",
+		url.QueryEscape(HY2Password),
+		host,
+		HY2Port,
+		query.Encode(),
 		url.QueryEscape(name),
 	)
 }

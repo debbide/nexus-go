@@ -26,6 +26,7 @@ import (
 	"github.com/sagernet/sing-box/dns/transport/local"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/direct"
+	"github.com/sagernet/sing-box/protocol/hysteria2"
 	"github.com/sagernet/sing-box/protocol/tuic"
 	"github.com/sagernet/sing-box/protocol/vless"
 	"github.com/sagernet/sing/common/json/badoption"
@@ -123,6 +124,49 @@ func startSingBoxRuntime() (*singBoxRuntime, error) {
 		})
 	}
 
+	if HY2Port != "" && HY2Port != "0" {
+		hy2Port, err := parseUint16Port(HY2Port)
+		if err != nil {
+			return nil, fmt.Errorf("invalid HY2_PORT: %w", err)
+		}
+
+		certPEM, keyPEM, err := generateSelfSignedCertificate(resolveHY2ServerName())
+		if err != nil {
+			return nil, fmt.Errorf("generate HY2 certificate: %w", err)
+		}
+
+		hy2Opts := &option.Hysteria2InboundOptions{
+			ListenOptions: option.ListenOptions{
+				Listen:     &listenAll,
+				ListenPort: hy2Port,
+			},
+			Users: []option.Hysteria2User{
+				{Name: singBoxTUICDefaultName, Password: HY2Password},
+			},
+			IgnoreClientBandwidth: true,
+			InboundTLSOptionsContainer: option.InboundTLSOptionsContainer{
+				TLS: &option.InboundTLSOptions{
+					Enabled:     true,
+					ServerName:  resolveHY2ServerName(),
+					ALPN:        badoption.Listable[string]{"h3"},
+					Certificate: badoption.Listable[string]{string(certPEM)},
+					Key:         badoption.Listable[string]{string(keyPEM)},
+				},
+			},
+		}
+		if HY2ObfsPass != "" {
+			hy2Opts.Obfs = &option.Hysteria2Obfs{
+				Type:     "salamander",
+				Password: HY2ObfsPass,
+			}
+		}
+		inbounds = append(inbounds, option.Inbound{
+			Type:    constant.TypeHysteria2,
+			Tag:     "hy2-in",
+			Options: hy2Opts,
+		})
+	}
+
 	instance, err := box.New(box.Options{
 		Context: ctx,
 		Options: option.Options{
@@ -153,11 +197,14 @@ func startSingBoxRuntime() (*singBoxRuntime, error) {
 		instance.Close()
 		return nil, err
 	}
+	parts := []string{fmt.Sprintf("vless-ws=127.0.0.1:%d%s", singBoxVLESSListenPort, singBoxVLESSPath())}
 	if TUICPort != "" && TUICPort != "0" {
-		log.Printf("[INFO] sing-box runtime started: vless-ws=127.0.0.1:%d%s tuic=0.0.0.0:%s", singBoxVLESSListenPort, singBoxVLESSPath(), TUICPort)
-	} else {
-		log.Printf("[INFO] sing-box runtime started: vless-ws=127.0.0.1:%d%s", singBoxVLESSListenPort, singBoxVLESSPath())
+		parts = append(parts, "tuic=0.0.0.0:"+TUICPort)
 	}
+	if HY2Port != "" && HY2Port != "0" {
+		parts = append(parts, "hy2=0.0.0.0:"+HY2Port)
+	}
+	log.Printf("[INFO] sing-box runtime started: %s", strings.Join(parts, " "))
 	return &singBoxRuntime{instance: instance}, nil
 }
 
@@ -165,6 +212,7 @@ func minimalSingBoxContext(ctx context.Context) context.Context {
 	inboundRegistry := inbound.NewRegistry()
 	vless.RegisterInbound(inboundRegistry)
 	tuic.RegisterInbound(inboundRegistry)
+	hysteria2.RegisterInbound(inboundRegistry)
 
 	outboundRegistry := outbound.NewRegistry()
 	direct.RegisterOutbound(outboundRegistry)
@@ -200,6 +248,20 @@ func singBoxVLESSPath() string {
 }
 
 func resolveTUICServerName() string {
+	if TUICDomain != "" {
+		return normalizeTUICHost(TUICDomain)
+	}
+	if publicIP := fetchPublicIPv4(); publicIP != "" {
+		return normalizeTUICHost(publicIP)
+	}
+	return "nexus.local"
+}
+
+func resolveHY2ServerName() string {
+	if HY2Domain != "" {
+		return normalizeTUICHost(HY2Domain)
+	}
+	// 与 TUIC 共用域名配置，方便只填一次
 	if TUICDomain != "" {
 		return normalizeTUICHost(TUICDomain)
 	}
