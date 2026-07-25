@@ -28,6 +28,79 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+# 写入 .env 的值：双引号 + 转义 $ ` " \ ，避免 source 时把密码里的 $9 当成位置参数
+quote_env_value() {
+  local s="${1-}"
+  local out='"'
+  local i=0
+  local c
+  while [ "$i" -lt "${#s}" ]; do
+    c="${s:$i:1}"
+    case "$c" in
+      \\) out="${out}\\\\" ;;
+      \") out="${out}\\\"" ;;
+      \$) out="${out}\\$" ;;
+      \`) out="${out}\\\`" ;;
+      *)  out="${out}${c}" ;;
+    esac
+    i=$((i + 1))
+  done
+  printf '%s' "${out}\""
+}
+
+# 安全读取 .env：不执行 shell 展开，避免 $1/$9 等在 set -u 下炸掉
+# 结果 export 到当前 shell（KEY=VALUE，值已去掉外层引号）
+load_env_file() {
+  local file="${1-}"
+  local line key val
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    # 去首尾空白（简易）
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in
+      ''|\#*) continue ;;
+    esac
+    case "$line" in
+      *=*) ;;
+      *) continue ;;
+    esac
+    key="${line%%=*}"
+    val="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"
+    # 去掉 KEY 两侧空白
+    key="${key#"${key%%[![:space:]]*}"}"
+    # 合法变量名
+    case "$key" in
+      ''|*[!A-Za-z0-9_]*|[0-9]*) continue ;;
+    esac
+    # 去掉值两侧空白
+    val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"
+    # 剥一层引号（"..." 或 '...'），保留内部字面量
+    if [ "${#val}" -ge 2 ]; then
+      case "$val" in
+        \"*\")
+          val="${val#\"}"
+          val="${val%\"}"
+          # 还原常见转义
+          val="${val//\\\\/\\}"
+          val="${val//\\\"/\"}"
+          val="${val//\\\$/\$}"
+          val="${val//\\\`/\`}"
+          ;;
+        \'*\')
+          val="${val#\'}"
+          val="${val%\'}"
+          ;;
+      esac
+    fi
+    # 用 printf %s 赋值，避免二次展开
+    printf -v "$key" '%s' "$val"
+    export "$key"
+  done < "$file"
+}
+
 # 检测 init/服务管理系统: systemd | openrc | none
 detect_init() {
   if need_cmd systemctl && [ -d /run/systemd/system ]; then
@@ -87,10 +160,7 @@ pick_port() {
 load_env_defaults() {
   if [ -f "${APP_ENV}" ]; then
     say "检测到已有配置文件，读取旧配置作为预设..."
-    # shellcheck disable=SC1090
-    set -a
-    . "${APP_ENV}"
-    set +a
+    load_env_file "${APP_ENV}"
   fi
 
   ENV_UUID="${ENV_UUID:-${UUID:-}}"
@@ -213,29 +283,31 @@ download_binary() {
 
 create_env_file() {
   say "正在生成本地配置文件: ${APP_ENV}"
-  cat > "${APP_ENV}" <<EOF
-PORT=${APP_PORT}
-SERVER_PORT=${APP_PORT}
-UUID=${ENV_UUID:-}
-NEZHA_SERVER=${ENV_NEZHA_SERVER:-}
-NEZHA_PORT=${ENV_NEZHA_PORT:-}
-NEZHA_KEY=${ENV_NEZHA_KEY:-}
-NEZHA_DOH=${ENV_NEZHA_DOH:-}
-CF_TUNNEL_TOKEN=${ENV_CF_TUNNEL_TOKEN:-}
-CF_DOMAIN=${ENV_CF_DOMAIN:-}
-SUB_PATH=${ENV_SUB_PATH:-}
-WSPATH=${ENV_WSPATH:-}
-TUIC_PORT=${ENV_TUIC_PORT:-}
-HY2_PORT=${ENV_HY2_PORT:-}
-HY2_DOMAIN=${ENV_HY2_DOMAIN:-}
-HY2_OBFS_PASSWORD=${ENV_HY2_OBFS_PASSWORD:-}
-UDP_IPV6_ONLY=${ENV_UDP_IPV6_ONLY:-false}
-DEBUG=${ENV_DEBUG:-true}
-EOF
+  # 所有字符串值加引号并转义 $，防止 start.sh / source 时把密码中的 $9 展开
+  {
+    printf 'PORT=%s\n' "$(quote_env_value "${APP_PORT}")"
+    printf 'SERVER_PORT=%s\n' "$(quote_env_value "${APP_PORT}")"
+    printf 'UUID=%s\n' "$(quote_env_value "${ENV_UUID:-}")"
+    printf 'NEZHA_SERVER=%s\n' "$(quote_env_value "${ENV_NEZHA_SERVER:-}")"
+    printf 'NEZHA_PORT=%s\n' "$(quote_env_value "${ENV_NEZHA_PORT:-}")"
+    printf 'NEZHA_KEY=%s\n' "$(quote_env_value "${ENV_NEZHA_KEY:-}")"
+    printf 'NEZHA_DOH=%s\n' "$(quote_env_value "${ENV_NEZHA_DOH:-}")"
+    printf 'CF_TUNNEL_TOKEN=%s\n' "$(quote_env_value "${ENV_CF_TUNNEL_TOKEN:-}")"
+    printf 'CF_DOMAIN=%s\n' "$(quote_env_value "${ENV_CF_DOMAIN:-}")"
+    printf 'SUB_PATH=%s\n' "$(quote_env_value "${ENV_SUB_PATH:-}")"
+    printf 'WSPATH=%s\n' "$(quote_env_value "${ENV_WSPATH:-}")"
+    printf 'TUIC_PORT=%s\n' "$(quote_env_value "${ENV_TUIC_PORT:-}")"
+    printf 'HY2_PORT=%s\n' "$(quote_env_value "${ENV_HY2_PORT:-}")"
+    printf 'HY2_DOMAIN=%s\n' "$(quote_env_value "${ENV_HY2_DOMAIN:-}")"
+    printf 'HY2_OBFS_PASSWORD=%s\n' "$(quote_env_value "${ENV_HY2_OBFS_PASSWORD:-}")"
+    printf 'UDP_IPV6_ONLY=%s\n' "$(quote_env_value "${ENV_UDP_IPV6_ONLY:-false}")"
+    printf 'DEBUG=%s\n' "$(quote_env_value "${ENV_DEBUG:-true}")"
+  } > "${APP_ENV}"
 }
 
 create_wrapper() {
   # 用 /bin/sh 以兼容无 bash 的精简系统(Alpine 等)；exec 让信号能正确传递给主进程
+  # .env 由 create_env_file 写成带引号+转义 $ 的形式，source 安全
   if [ -x /bin/bash ]; then
     SHEBANG="#!/bin/bash"
   else
@@ -476,8 +548,7 @@ set_udp_ipv6_only() {
     return 1
   fi
   if [ -z "$want" ]; then
-    # shellcheck disable=SC1090
-    . "${APP_ENV}"
+    load_env_file "${APP_ENV}"
     printf "当前 UDP_IPV6_ONLY=%s\n" "${UDP_IPV6_ONLY:-false}"
     printf "输入 true(仅IPv6) 或 false(双栈) [当前 %s]: " "${UDP_IPV6_ONLY:-false}"
     read -r want </dev/tty
@@ -490,15 +561,15 @@ set_udp_ipv6_only() {
   esac
 
   if grep -qE '^UDP_IPV6_ONLY=' "${APP_ENV}" 2>/dev/null; then
-    # 兼容 sed -i 在 GNU/BusyBox
+    # 兼容 sed -i 在 GNU/BusyBox；值带引号与 create_env_file 一致
     if sed --version >/dev/null 2>&1; then
-      sed -i "s/^UDP_IPV6_ONLY=.*/UDP_IPV6_ONLY=${want}/" "${APP_ENV}"
+      sed -i "s/^UDP_IPV6_ONLY=.*/UDP_IPV6_ONLY=\"${want}\"/" "${APP_ENV}"
     else
-      sed -i '' "s/^UDP_IPV6_ONLY=.*/UDP_IPV6_ONLY=${want}/" "${APP_ENV}" 2>/dev/null \
-        || sed -i "s/^UDP_IPV6_ONLY=.*/UDP_IPV6_ONLY=${want}/" "${APP_ENV}"
+      sed -i '' "s/^UDP_IPV6_ONLY=.*/UDP_IPV6_ONLY=\"${want}\"/" "${APP_ENV}" 2>/dev/null \
+        || sed -i "s/^UDP_IPV6_ONLY=.*/UDP_IPV6_ONLY=\"${want}\"/" "${APP_ENV}"
     fi
   else
-    printf '\nUDP_IPV6_ONLY=%s\n' "${want}" >> "${APP_ENV}"
+    printf '\nUDP_IPV6_ONLY="%s"\n' "${want}" >> "${APP_ENV}"
   fi
   say "已写入 UDP_IPV6_ONLY=${want} → ${APP_ENV}"
   restart_app
@@ -515,10 +586,8 @@ show_nodes() {
     return 1
   fi
 
-  # shellcheck disable=SC1090
-  set -a
-  . "${APP_ENV}"
-  set +a
+  # 安全读取，避免密码中的 $9 在 set -u 下触发 unbound variable
+  load_env_file "${APP_ENV}"
 
   local uuid port sub_path ws_path name
   local tuic_port tuic_domain tuic_pass
