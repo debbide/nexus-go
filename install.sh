@@ -411,6 +411,102 @@ fetch_public_ip() {
   fi
 }
 
+fetch_public_ipv6() {
+  local ip=""
+  local u
+  for u in \
+    "https://api-ipv6.ip.sb/ip" \
+    "https://api6.ipify.org" \
+    "https://v6.ident.me"
+  do
+    if need_cmd curl; then
+      ip="$(curl -fsS --connect-timeout 5 "$u" 2>/dev/null | tr -d '[:space:]')"
+    elif need_cmd wget; then
+      ip="$(wget -qO- --timeout=5 "$u" 2>/dev/null | tr -d '[:space:]')"
+    fi
+    # 粗判 IPv6
+    if [ -n "$ip" ] && printf '%s' "$ip" | grep -q ':'; then
+      printf '%s' "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# URI host：IPv6 包 []，域名/IPv4 原样
+format_uri_host() {
+  local h="$1"
+  case "$h" in
+    \[*\]) printf '%s' "$h" ;;
+    *:*)   printf '[%s]' "$h" ;;
+    *)     printf '%s' "$h" ;;
+  esac
+}
+
+is_truthy() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 重启服务（装完改 .env 后用）
+restart_app() {
+  if [ "$(id -u)" != "0" ]; then
+    warn "非 root，尝试 pkill 后 nohup 拉起..."
+    pkill -9 -f "${APP_BIN}" >/dev/null 2>&1 || true
+    nohup "${WRAPPER}" >/dev/null 2>&1 &
+    return
+  fi
+  case "$(detect_init)" in
+    systemd) systemctl restart "${APP_NAME}" ;;
+    openrc)  rc-service "${APP_NAME}" restart ;;
+    *)
+      pkill -9 -f "${APP_BIN}" >/dev/null 2>&1 || true
+      nohup "${WRAPPER}" >/dev/null 2>&1 &
+      ;;
+  esac
+}
+
+# 菜单/命令行：切换 UDP_IPV6_ONLY 并写回 .env、重启
+set_udp_ipv6_only() {
+  local want="${1:-}"
+  if [ ! -f "${APP_ENV}" ]; then
+    err "未找到 ${APP_ENV}，请先安装。"
+    return 1
+  fi
+  if [ -z "$want" ]; then
+    # shellcheck disable=SC1090
+    . "${APP_ENV}"
+    printf "当前 UDP_IPV6_ONLY=%s\n" "${UDP_IPV6_ONLY:-false}"
+    printf "输入 true(仅IPv6) 或 false(双栈) [当前 %s]: " "${UDP_IPV6_ONLY:-false}"
+    read -r want </dev/tty
+    want="${want:-${UDP_IPV6_ONLY:-false}}"
+  fi
+  case "$(printf '%s' "$want" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) want=true ;;
+    0|false|no|off) want=false ;;
+    *) err "无效值: $want（请用 true/false）"; return 1 ;;
+  esac
+
+  if grep -qE '^UDP_IPV6_ONLY=' "${APP_ENV}" 2>/dev/null; then
+    # 兼容 sed -i 在 GNU/BusyBox
+    if sed --version >/dev/null 2>&1; then
+      sed -i "s/^UDP_IPV6_ONLY=.*/UDP_IPV6_ONLY=${want}/" "${APP_ENV}"
+    else
+      sed -i '' "s/^UDP_IPV6_ONLY=.*/UDP_IPV6_ONLY=${want}/" "${APP_ENV}" 2>/dev/null \
+        || sed -i "s/^UDP_IPV6_ONLY=.*/UDP_IPV6_ONLY=${want}/" "${APP_ENV}"
+    fi
+  else
+    printf '\nUDP_IPV6_ONLY=%s\n' "${want}" >> "${APP_ENV}"
+  fi
+  say "已写入 UDP_IPV6_ONLY=${want} → ${APP_ENV}"
+  restart_app
+  say "服务已重启。当前模式: $([ "$want" = true ] && echo 'IPv6 only' || echo '双栈')"
+  sleep 1
+  show_nodes || true
+}
+
 # 根据 .env 在终端打印各协议节点链接（方便只拷某一个）
 show_nodes() {
   if [ ! -f "${APP_ENV}" ]; then
@@ -427,7 +523,7 @@ show_nodes() {
   local uuid port sub_path ws_path name
   local tuic_port tuic_domain tuic_pass
   local hy2_port hy2_domain hy2_pass hy2_obfs
-  local cf_domain public_ip host sni
+  local cf_domain public_ip public_ip6 host sni host_uri udp_mode
   local vless_url cf_vless_url tuic_url hy2_url sub_url
   local enc_uuid enc_pass enc_name
 
@@ -457,19 +553,31 @@ show_nodes() {
   hy2_obfs="${HY2_OBFS_PASSWORD:-}"
 
   cf_domain="${CF_DOMAIN:-}"
+  if is_truthy "${UDP_IPV6_ONLY:-false}"; then
+    udp_mode="IPv6 only"
+  else
+    udp_mode="双栈"
+  fi
+
   public_ip="$(fetch_public_ip || true)"
+  public_ip6="$(fetch_public_ipv6 || true)"
   if [ -z "${public_ip}" ]; then
     public_ip="YOUR_SERVER_IP"
-    warn "无法自动获取公网 IP，直连节点请把 YOUR_SERVER_IP 换成实际 IP。"
+    warn "无法自动获取公网 IPv4，直连 VLESS 请自行替换 YOUR_SERVER_IP。"
+  fi
+  if is_truthy "${UDP_IPV6_ONLY:-false}" && [ -z "${public_ip6}" ]; then
+    warn "UDP_IPV6_ONLY=true 但未能获取公网 IPv6，TUIC/HY2 请填域名或手动替换。"
+    public_ip6="YOUR_IPV6"
   fi
 
   printf "\n%b\n" "${GREEN}======== Nexus 节点链接 ========${NC}"
   info "配置: ${APP_ENV}"
   info "本机 Web 端口: ${port}  |  订阅路径: /${sub_path}  |  WSPATH: /${ws_path}"
+  info "TUIC/HY2 监听模式: ${udp_mode}  (UDP_IPV6_ONLY=${UDP_IPV6_ONLY:-false})"
   echo
 
   # --- VLESS 直连（IP:PORT，无 TLS）---
-  printf "%b\n" "${YELLOW}[1] VLESS-WS 直连（IP，不经 CF）${NC}"
+  printf "%b\n" "${YELLOW}[1] VLESS-WS 直连（IPv4，不经 CF）${NC}"
   vless_url="vless://${uuid}@${public_ip}:${port}?encryption=none&security=none&type=ws&host=${public_ip}&path=%2F${ws_path}#${name}-VLESS"
   printf "%s\n\n" "${vless_url}"
 
@@ -492,13 +600,20 @@ show_nodes() {
 
   # --- TUIC ---
   if [ -n "${tuic_port}" ] && [ "${tuic_port}" != "0" ]; then
-    host="${tuic_domain:-${public_ip}}"
+    if [ -n "${tuic_domain}" ]; then
+      host="${tuic_domain}"
+    elif is_truthy "${UDP_IPV6_ONLY:-false}"; then
+      host="${public_ip6}"
+    else
+      host="${public_ip}"
+    fi
     sni="${host}"
+    host_uri="$(format_uri_host "${host}")"
     enc_uuid="$(urlencode "${uuid}")"
     enc_pass="$(urlencode "${tuic_pass}")"
     enc_name="$(urlencode "${name}-TUIC")"
-    printf "%b\n" "${YELLOW}[3] TUIC（UDP 直连，不经 CF）${NC}"
-    tuic_url="tuic://${enc_uuid}:${enc_pass}@${host}:${tuic_port}?allow_insecure=1&alpn=h3&congestion_control=bbr&insecure=1&skip-cert-verify=true&sni=${sni}&udp_relay_mode=native&version=5#${enc_name}"
+    printf "%b\n" "${YELLOW}[3] TUIC（UDP，模式: ${udp_mode}）${NC}"
+    tuic_url="tuic://${enc_uuid}:${enc_pass}@${host_uri}:${tuic_port}?allow_insecure=1&alpn=h3&congestion_control=bbr&insecure=1&skip-cert-verify=true&sni=${sni}&udp_relay_mode=native&version=5#${enc_name}"
     printf "%s\n\n" "${tuic_url}"
   else
     info "[3] 未开启 TUIC（TUIC_PORT 为空）"
@@ -507,12 +622,19 @@ show_nodes() {
 
   # --- HY2 ---
   if [ -n "${hy2_port}" ] && [ "${hy2_port}" != "0" ]; then
-    host="${hy2_domain:-${public_ip}}"
+    if [ -n "${hy2_domain}" ]; then
+      host="${hy2_domain}"
+    elif is_truthy "${UDP_IPV6_ONLY:-false}"; then
+      host="${public_ip6}"
+    else
+      host="${public_ip}"
+    fi
     sni="${host}"
+    host_uri="$(format_uri_host "${host}")"
     enc_pass="$(urlencode "${hy2_pass}")"
     enc_name="$(urlencode "${name}-HY2")"
-    printf "%b\n" "${YELLOW}[4] Hysteria2 / hy2（UDP 直连，不经 CF）${NC}"
-    hy2_url="hysteria2://${enc_pass}@${host}:${hy2_port}?insecure=1&sni=${sni}&alpn=h3"
+    printf "%b\n" "${YELLOW}[4] Hysteria2 / hy2（UDP，模式: ${udp_mode}）${NC}"
+    hy2_url="hysteria2://${enc_pass}@${host_uri}:${hy2_port}?insecure=1&sni=${sni}&alpn=h3"
     if [ -n "${hy2_obfs}" ]; then
       hy2_url="${hy2_url}&obfs=salamander&obfs-password=$(urlencode "${hy2_obfs}")"
     fi
@@ -525,6 +647,7 @@ show_nodes() {
 
   printf "%b\n" "${GREEN}================================${NC}"
   info "提示: 只想用某一个协议时，复制对应那一行即可。"
+  info "切换监听: bash install.sh v6only on|off   或菜单选 4"
   info "再次查看: bash install.sh nodes   或菜单选 3"
   echo
 }
@@ -557,12 +680,14 @@ show_menu() {
   printf "  ${YELLOW}1.${NC} 安装 / 启动服务 (自动适配 systemd / OpenRC)\n"
   printf "  ${YELLOW}2.${NC} 完全卸载节点\n"
   printf "  ${YELLOW}3.${NC} 打印节点链接 (VLESS / CF / TUIC / HY2)\n"
+  printf "  ${YELLOW}4.${NC} 切换 TUIC/HY2 监听 (双栈 / IPv6 only)\n"
   printf "  ${YELLOW}0.${NC} 退出脚本\n"
-  printf "请输入数字 [0-3]: "; read -r choice </dev/tty
+  printf "请输入数字 [0-4]: "; read -r choice </dev/tty
   case "${choice}" in
     1) run_install ;;
     2) uninstall_app ;;
     3) show_nodes ;;
+    4) set_udp_ipv6_only ;;
     *) exit 0 ;;
   esac
 }
@@ -570,4 +695,12 @@ show_menu() {
 if [ "${1:-}" = "uninstall" ]; then uninstall_app
 elif [ "${1:-}" = "install" ]; then run_install
 elif [ "${1:-}" = "nodes" ] || [ "${1:-}" = "show" ]; then show_nodes
+elif [ "${1:-}" = "v6only" ] || [ "${1:-}" = "ipv6-only" ]; then
+  # bash install.sh v6only on|off|true|false
+  case "${2:-}" in
+    on|ON|true|TRUE|1) set_udp_ipv6_only true ;;
+    off|OFF|false|FALSE|0) set_udp_ipv6_only false ;;
+    "") set_udp_ipv6_only ;;
+    *) set_udp_ipv6_only "$2" ;;
+  esac
 else show_menu; fi
