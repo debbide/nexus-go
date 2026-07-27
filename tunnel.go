@@ -247,9 +247,8 @@ func cfTunnelConnect(connIndex uint8, accountTag string, tunnelSecret, tunnelID 
 	// The edge sends requests (like control-stream) to us.
 	// ReadIdleTimeout 过短会在边缘静默时误杀整条 h2 连接（代理空�?长视频间隙常见）
 	server := &http2.Server{
-		ReadIdleTimeout:       5 * time.Minute,
-		IdleTimeout:           10 * time.Minute,
-		MaxConcurrentStreams:   32,
+		ReadIdleTimeout: 5 * time.Minute,
+		IdleTimeout:     10 * time.Minute,
 	}
 	server.ServeConn(conn, &http2.ServeConnOpts{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
