@@ -645,6 +645,9 @@ show_nodes() {
   hy2_pass="${HY2_PASSWORD:-${uuid}}"
   hy2_obfs="${HY2_OBFS_PASSWORD:-}"
 
+  grpc_port="${GRPC_PORT:-}"
+  grpc_svc="${GRPC_SERVICE_NAME:-GunService}"
+
   cf_domain="${CF_DOMAIN:-}"
   if is_truthy "${UDP_IPV6_ONLY:-false}"; then
     udp_mode="IPv6 only"
@@ -667,6 +670,9 @@ show_nodes() {
   info "配置: ${APP_ENV}"
   info "本机 Web 端口: ${port}  |  订阅路径: /${sub_path}  |  WSPATH: /${ws_path}"
   info "TUIC/HY2 监听模式: ${udp_mode}  (UDP_IPV6_ONLY=${UDP_IPV6_ONLY:-false})"
+  if [ -n "${grpc_port}" ] && [ "${grpc_port}" != "0" ]; then
+    info "gRPC: ${grpc_port}  serviceName=${grpc_svc}  (官方隧道可指 http://127.0.0.1:${grpc_port})"
+  fi
   echo
 
   # --- VLESS 直连（IP:PORT，无 TLS）---
@@ -738,6 +744,26 @@ show_nodes() {
     echo
   fi
 
+  # --- VLESS-gRPC ---
+  if [ -n "${grpc_port}" ] && [ "${grpc_port}" != "0" ]; then
+    enc_svc="$(urlencode "${grpc_svc}")"
+    enc_name="$(urlencode "${name}-gRPC")"
+    printf "%b\n" "${YELLOW}[5] VLESS-gRPC 直连（IP:${grpc_port}，本机 h2c，security=none）${NC}"
+    printf "vless://%s@%s:%s?encryption=none&security=none&type=grpc&serviceName=%s&mode=gun#%s\n\n" \
+      "${uuid}" "${public_ip}" "${grpc_port}" "${enc_svc}" "${enc_name}"
+    if [ -n "${cf_domain}" ]; then
+      enc_name_cf="$(urlencode "${name}-CF-gRPC")"
+      printf "%b\n" "${YELLOW}[5b] VLESS-gRPC + CF 域名（443 TLS，边缘终结；源站 h2c）${NC}"
+      printf "vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=grpc&serviceName=%s&mode=gun#%s\n\n" \
+        "${uuid}" "${cf_domain}" "${cf_domain}" "${enc_svc}" "${enc_name_cf}"
+      info "官方 cloudflared 可另指: http://127.0.0.1:${grpc_port}"
+      echo
+    fi
+  else
+    info "[5] 未开启 gRPC（GRPC_PORT 为空）"
+    echo
+  fi
+
   printf "%b\n" "${GREEN}================================${NC}"
   info "提示: 只想用某一个协议时，复制对应那一行即可。"
   info "切换监听: bash install.sh v6only on|off   或菜单选 4"
@@ -772,7 +798,7 @@ show_menu() {
   printf "\n%b\n" "${GREEN} Nexus (VPS 实体常驻版) 一键管理脚本 [系统自适应] ${NC}"
   printf "  ${YELLOW}1.${NC} 安装 / 启动服务 (自动适配 systemd / OpenRC)\n"
   printf "  ${YELLOW}2.${NC} 完全卸载节点\n"
-  printf "  ${YELLOW}3.${NC} 打印节点链接 (VLESS / CF / TUIC / HY2)\n"
+  printf "  ${YELLOW}3.${NC} 打印节点链接 (VLESS / CF / TUIC / HY2 / gRPC)\n"
   printf "  ${YELLOW}4.${NC} 切换 TUIC/HY2 监听 (双栈 / IPv6 only)\n"
   printf "  ${YELLOW}0.${NC} 退出脚本\n"
   printf "请输入数字 [0-4]: "; read -r choice </dev/tty
