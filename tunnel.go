@@ -28,9 +28,13 @@ import (
 var tunnelLog = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile)
 
 // gRPC 诊断：并发流计数 + 单调 id，方便对照「测速挂」时间点
+// grpcStreamSeq  atomic.Uint64
+// grpcStreamLive atomic.Int64
+// grpcStreamPeak tracks the highest concurrent stream count in the current burst.
 var (
 	grpcStreamSeq  atomic.Uint64
 	grpcStreamLive atomic.Int64
+	grpcStreamPeak atomic.Int64
 )
 
 // tunnelConns holds the active CF-edge TCP connections keyed by connIndex.
@@ -457,13 +461,25 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 		err := proxyGRPCToOrigin(w, r)
 		live = grpcStreamLive.Add(-1)
 		dur := time.Since(start).Round(time.Millisecond)
-		// When the last concurrent stream finishes, force-close the h2c pool so
-		// the next stream gets a fresh connection with a full flow-control window.
-		// During a burst (live>0) only throttle to avoid cascade teardown.
+		// Track peak concurrency for this burst.
+		for {
+			cur := grpcStreamPeak.Load()
+			if live+1 <= cur {
+				break
+			}
+			if grpcStreamPeak.CompareAndSwap(cur, live+1) {
+				break
+			}
+		}
 		if live == 0 {
+			peak := grpcStreamPeak.Swap(0)
 			grpcTransport().CloseIdleConnections()
 			newGRPCTransport()
-			go reconnectAllTunnels()
+			// Only reconnect tunnels after a real speed-test burst (>=5 concurrent streams).
+			// Single test streams must not trigger reconnect or the test itself will fail.
+			if peak >= 5 {
+				go reconnectAllTunnels()
+			}
 		} else {
 			throttledCloseIdle()
 		}
