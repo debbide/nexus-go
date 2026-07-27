@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -525,22 +526,139 @@ var grpcH2cTransport = &http2.Transport{
 }
 
 // proxyGRPCToOrigin 将 CF 边缘的 gRPC 流以 h2c 转到本机 VLESS-gRPC。
+// proxyGRPCToOrigin 将 CF 边缘的 gRPC 流以 h2c 转到本机 VLESS-gRPC。
 func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 	grpcAddr := fmt.Sprintf("127.0.0.1:%d", singBoxGRPCListenPort)
-	targetURL, _ := url.Parse(fmt.Sprintf("http://%s", grpcAddr))
+	t0 := time.Now()
 
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	proxy.Transport = grpcH2cTransport
-	
-	// ⭐️ 核心修复：10毫秒缓冲，防止小数据帧海量齐发触发CF的DDOS封锁 ⭐️
-	proxy.FlushInterval = 10 * time.Millisecond 
-
-	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
-		tunnelLog.Printf("[TUNNEL] gRPC proxy error to origin: %v", err)
-		rw.WriteHeader(http.StatusBadGateway)
+	outReq := r.Clone(r.Context())
+	outReq.URL = &url.URL{
+		Scheme:   "http",
+		Host:     grpcAddr,
+		Path:     r.URL.Path,
+		RawPath:  r.URL.RawPath,
+		RawQuery: r.URL.RawQuery,
+	}
+	outReq.RequestURI = ""
+	outReq.Host = grpcAddr
+	if outReq.Body == nil {
+		outReq.Body = http.NoBody
 	}
 
-	proxy.ServeHTTP(w, r)
+	for h := range grpcHopHeaders {
+		outReq.Header.Del(h)
+	}
+	outReq.Header.Del("Cf-Cloudflared-Proxy-Connection-Upgrade")
+	outReq.Header.Set("TE", "trailers")
+	if outReq.Header.Get("Content-Type") == "" {
+		outReq.Header.Set("Content-Type", "application/grpc")
+	}
+
+	resp, err := grpcH2cTransport.RoundTrip(outReq)
+	headersDur := time.Since(t0).Round(time.Millisecond)
+	if err != nil {
+		grpcH2cTransport.CloseIdleConnections()
+		w.WriteHeader(http.StatusBadGateway)
+		return fmt.Errorf("h2c RoundTrip %s after %s: %w", grpcAddr, headersDur, err)
+	}
+	defer resp.Body.Close()
+
+	tunnelLog.Printf("[TUNNEL] gRPC origin headers status=%d dur=%s ct=%q",
+		resp.StatusCode, headersDur, resp.Header.Get("Content-Type"))
+
+	for h := range grpcHopHeaders {
+		resp.Header.Del(h)
+	}
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+
+	// ⭐️ 核心修复 1：提前声明 Trailer！
+	// Go 语言强制规定，如果不提前声明，等数据发完了再去 w.Header().Add Trailer 是无效的，会被直接丢弃。
+	// 这就是导致你最开始“直连通，CF不通”的罪魁祸首（客户端收不到 gRPC-status 判定连接失败）。
+	w.Header().Add("Trailer", "Grpc-Status")
+	w.Header().Add("Trailer", "Grpc-Message")
+
+	w.WriteHeader(resp.StatusCode)
+
+	// ⭐️ 核心修复 2：带互斥锁的定时缓冲 Flush ⭐️
+	// 彻底解决 Cloudflare 认为你发起了 HTTP/2 帧洪水（Frame Flood）DDOS 的问题。
+	bw := bufio.NewWriterSize(w, 16*1024)
+	var mu sync.Mutex
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				mu.Lock()
+				if bw.Buffered() > 0 {
+					bw.Flush()
+					if f, ok := w.(http.Flusher); ok {
+						f.Flush()
+					}
+				}
+				mu.Unlock()
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	var written int64
+	buf := make([]byte, 32*1024)
+	for {
+		nr, er := resp.Body.Read(buf)
+		if nr > 0 {
+			mu.Lock()
+			nw, ew := bw.Write(buf[:nr])
+			mu.Unlock()
+
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if ew != nil {
+				close(done)
+				grpcH2cTransport.CloseIdleConnections()
+				return fmt.Errorf("write to edge after %d bytes: %w", written, ew)
+			}
+		}
+		if er != nil {
+			close(done)
+			// 最后做一次清空
+			mu.Lock()
+			bw.Flush()
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			mu.Unlock()
+
+			if er == io.EOF {
+				break
+			}
+			if r.Context().Err() != nil {
+				return fmt.Errorf("edge canceled after %d bytes: %w (ctx=%v)", written, er, r.Context().Err())
+			}
+			grpcH2cTransport.CloseIdleConnections()
+			return fmt.Errorf("read origin after %d bytes: %w", written, er)
+		}
+	}
+
+	// 此时 Body 已经完全读完（EOF），resp.Trailer 里终于有值了，把它写进 w.Header 里，Go HTTP 框架会自动在末尾加上这俩尾巴！
+	for k, vv := range resp.Trailer {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+
+	tunnelLog.Printf("[TUNNEL] gRPC body done bytes=%d bodyDur=%s totalDur=%s",
+		written,
+		time.Since(t0).Round(time.Millisecond)-headersDur,
+		time.Since(t0).Round(time.Millisecond),
+	)
 	return nil
 }
 
