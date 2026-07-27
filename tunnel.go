@@ -289,7 +289,8 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 		r.Header.Get("Sec-Websocket-Key") != "" ||
 		r.Header.Get("Sec-WebSocket-Key") != "" ||
 		strings.ToLower(r.Header.Get("Upgrade")) == "websocket"
-	ct := strings.ToLower(r.Header.Get("Content-Type"))
+	ctRaw := r.Header.Get("Content-Type")
+	ct := strings.ToLower(ctRaw)
 	svcName := strings.ToLower(GRPCServiceName)
 	if svcName == "" {
 		svcName = "gunservice"
@@ -297,6 +298,19 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 	pathLower := strings.ToLower(r.URL.Path)
 	isGRPC := strings.HasPrefix(ct, "application/grpc") ||
 		strings.Contains(pathLower, "/"+svcName+"/")
+
+	// 总入口：任何非 control 请求都先打一行，失败也能看见「有没有进来、被判成啥」
+	branch := "http"
+	if isWebSocket {
+		branch = "ws"
+	} else if isGRPC {
+		branch = "grpc"
+	}
+	log.Printf("[TUNNEL] IN conn=%d branch=%s method=%s path=%s ct=%q upgrade=%q cf-upgrade=%q proto=%s host=%s",
+		connIndex, branch, r.Method, r.URL.RequestURI(), ctRaw,
+		r.Header.Get("Upgrade"), r.Header.Get("Cf-Cloudflared-Proxy-Connection-Upgrade"),
+		r.Proto, r.Host,
+	)
 
 	if isWebSocket {
 		// ---- WebSocket 代理 → Web 端口（再桥到 sing-box WS）----
