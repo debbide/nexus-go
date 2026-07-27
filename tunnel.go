@@ -15,10 +15,8 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -428,14 +426,14 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 		id := grpcStreamSeq.Add(1)
 		live := grpcStreamLive.Add(1)
 		start := time.Now()
-		tunnelLog.Printf("[TUNNEL] gRPC#%d START live=%d conn=%d �?127.0.0.1:%d method=%s path=%s ct=%q te=%q cl=%s proto=%s",
-			id, live, connIndex, singBoxGRPCListenPort,
-			r.Method, r.URL.RequestURI(),
-			r.Header.Get("Content-Type"),
-			r.Header.Get("Transfer-Encoding"),
-			r.Header.Get("Content-Length"),
-			r.Proto,
-		)
+		tunnelLog.Printf("[TUNNEL] gRPC#%d START live=%d conn=%d -> 127.0.0.1:%d method=%s path=%s ct=%q TE=%q cl=%s proto=%s",
+				id, live, connIndex, singBoxGRPCListenPort,
+				r.Method, r.URL.RequestURI(),
+				r.Header.Get("Content-Type"),
+				r.Header.Get("TE"),
+				r.Header.Get("Content-Length"),
+				r.Proto,
+			)
 		err := proxyGRPCToOrigin(w, r)
 		live = grpcStreamLive.Add(-1)
 		dur := time.Since(start).Round(time.Millisecond)
@@ -496,9 +494,7 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 	io.Copy(w, resp.Body)
 }
 
-// hop-by-hop 头，反代时必须剥掉（RFC 7230�?
-// 不要删除 te：gRPC 需要 TE: trailers（删掉客户端会像完全没反应）
-// hop-by-hop 头。不要删 te：gRPC 需要 TE: trailers
+// hop-by-hop: do NOT strip "te" — gRPC needs TE: trailers end-to-end.
 var grpcHopHeaders = map[string]bool{
 	"connection":          true,
 	"keep-alive":          true,
@@ -509,49 +505,56 @@ var grpcHopHeaders = map[string]bool{
 	"proxy-connection":    true,
 }
 
-// 全局 h2c Transport：多路复用到本机 gRPC?
-// 参?cloudflared：gRPC 需要及?flush，但?32KiB 块而不是每字节一帧?
+// Shared h2c transport to local VLESS-gRPC (grpclite).
 var grpcH2cTransport = &http2.Transport{
 	AllowHTTP: true,
-	// AllowHTTP 时可?http:// URL；DialTLSContext 仍用于建立底层连?
 	DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
 		d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
 		return d.DialContext(ctx, network, addr)
 	},
-	ReadIdleTimeout: 30 * time.Second,
-	PingTimeout:     10 * time.Second,
-	// 略增并发 stream，测速会开很多子连?
+	ReadIdleTimeout:   30 * time.Second,
+	PingTimeout:       10 * time.Second,
 	MaxHeaderListSize: 262144,
 }
 
-// proxyGRPCToOrigin 将 CF 边缘的 gRPC 流以 h2c 转到本机 VLESS-gRPC。
-// proxyGRPCToOrigin 将 CF 边缘的 gRPC 流以 h2c 转到本机 VLESS-gRPC。
+// proxyGRPCToOrigin forwards CF-edge gRPC streams to local h2c sing-box.
+// Request body is streamed via pipe while response body is copied to the edge.
 func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 	grpcAddr := fmt.Sprintf("127.0.0.1:%d", singBoxGRPCListenPort)
 	t0 := time.Now()
 
-	outReq := r.Clone(r.Context())
-	outReq.URL = &url.URL{
-		Scheme:   "http",
-		Host:     grpcAddr,
-		Path:     r.URL.Path,
-		RawPath:  r.URL.RawPath,
-		RawQuery: r.URL.RawQuery,
-	}
-	outReq.RequestURI = ""
-	outReq.Host = grpcAddr
-	if outReq.Body == nil {
-		outReq.Body = http.NoBody
-	}
+	pr, pw := io.Pipe()
+	go func() {
+		var err error
+		if r.Body != nil {
+			_, err = io.Copy(pw, r.Body)
+		}
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		_ = pw.Close()
+	}()
 
-	for h := range grpcHopHeaders {
-		outReq.Header.Del(h)
+	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, "http://"+grpcAddr+r.URL.RequestURI(), pr)
+	if err != nil {
+		_ = pr.Close()
+		w.WriteHeader(http.StatusBadGateway)
+		return err
 	}
-	outReq.Header.Del("Cf-Cloudflared-Proxy-Connection-Upgrade")
+	for k, vv := range r.Header {
+		lk := strings.ToLower(k)
+		if grpcHopHeaders[lk] || strings.HasPrefix(lk, "cf-") || lk == "host" {
+			continue
+		}
+		for _, v := range vv {
+			outReq.Header.Add(k, v)
+		}
+	}
 	outReq.Header.Set("TE", "trailers")
-	if outReq.Header.Get("Content-Type") == "" {
-		outReq.Header.Set("Content-Type", "application/grpc")
-	}
+	outReq.Header.Set("Content-Type", "application/grpc")
+	outReq.Host = grpcAddr
+	outReq.ContentLength = -1
 
 	resp, err := grpcH2cTransport.RoundTrip(outReq)
 	headersDur := time.Since(t0).Round(time.Millisecond)
@@ -573,68 +576,39 @@ func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 			w.Header().Add(k, v)
 		}
 	}
-
-	// ⭐️ 核心修复 1：提前声明 Trailer！
-	// Go 语言强制规定，如果不提前声明，等数据发完了再去 w.Header().Add Trailer 是无效的，会被直接丢弃。
-	// 这就是导致你最开始“直连通，CF不通”的罪魁祸首（客户端收不到 gRPC-status 判定连接失败）。
+	// net/http requires Trailer names before WriteHeader.
 	w.Header().Add("Trailer", "Grpc-Status")
 	w.Header().Add("Trailer", "Grpc-Message")
+	for k := range resp.Trailer {
+		w.Header().Add("Trailer", k)
+	}
 
 	w.WriteHeader(resp.StatusCode)
-
-	// ⭐️ 核心修复 2：带互斥锁的定时缓冲 Flush ⭐️
-	// 彻底解决 Cloudflare 认为你发起了 HTTP/2 帧洪水（Frame Flood）DDOS 的问题。
-	bw := bufio.NewWriterSize(w, 16*1024)
-	var mu sync.Mutex
-	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				mu.Lock()
-				if bw.Buffered() > 0 {
-					bw.Flush()
-					if f, ok := w.(http.Flusher); ok {
-						f.Flush()
-					}
-				}
-				mu.Unlock()
-			case <-done:
-				return
-			}
-		}
-	}()
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 
 	var written int64
 	buf := make([]byte, 32*1024)
 	for {
 		nr, er := resp.Body.Read(buf)
 		if nr > 0 {
-			mu.Lock()
-			nw, ew := bw.Write(buf[:nr])
-			mu.Unlock()
-
+			nw, ew := w.Write(buf[:nr])
 			if nw > 0 {
 				written += int64(nw)
 			}
-			if ew != nil {
-				close(done)
-				grpcH2cTransport.CloseIdleConnections()
-				return fmt.Errorf("write to edge after %d bytes: %w", written, ew)
-			}
-		}
-		if er != nil {
-			close(done)
-			// 最后做一次清空
-			mu.Lock()
-			bw.Flush()
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
-			mu.Unlock()
-
+			if ew != nil {
+				grpcH2cTransport.CloseIdleConnections()
+				return fmt.Errorf("write to edge after %d bytes: %w", written, ew)
+			}
+			if nw != nr {
+				return fmt.Errorf("short write to edge after %d bytes", written)
+			}
+		}
+		if er != nil {
 			if er == io.EOF {
 				break
 			}
@@ -646,7 +620,6 @@ func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 
-	// 此时 Body 已经完全读完（EOF），resp.Trailer 里终于有值了，把它写进 w.Header 里，Go HTTP 框架会自动在末尾加上这俩尾巴！
 	for k, vv := range resp.Trailer {
 		for _, v := range vv {
 			w.Header().Add(k, v)
