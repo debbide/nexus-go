@@ -473,11 +473,10 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 		}
 		if live == 0 {
 			peak := grpcStreamPeak.Swap(0)
-			grpcTransport().CloseIdleConnections()
-			newGRPCTransport()
-			// Only reconnect tunnels after a real speed-test burst (>=5 concurrent streams).
-			// Single test streams must not trigger reconnect or the test itself will fail.
 			if peak >= 5 {
+				// Real speed-test burst: replace transport and reconnect tunnels.
+				grpcTransport().CloseIdleConnections()
+				newGRPCTransport()
 				go reconnectAllTunnels()
 			}
 		} else {
