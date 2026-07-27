@@ -15,7 +15,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"strings"
 	"time"
@@ -434,39 +433,119 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 	io.Copy(w, resp.Body)
 }
 
-// 全局唯一 h2c Transport：多路复用到本机 gRPC，避免每请求新建 TCP 打满 FD/端口。
-// ReadIdleTimeout+PingTimeout：空闲发 PING，踢掉半死连接（解决「先通后断」复用脏连接）。
-var (
-	grpcH2cTransport = &http2.Transport{
-		AllowHTTP: true,
-		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-			d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
-			return d.DialContext(ctx, network, addr)
-		},
-		ReadIdleTimeout: 30 * time.Second,
-		PingTimeout:     10 * time.Second,
-	}
-	grpcH2cClient = &http.Client{
-		Transport: grpcH2cTransport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-)
+// hop-by-hop 头，反代时必须剥掉（RFC 7230）
+var grpcHopHeaders = map[string]bool{
+	"connection":          true,
+	"keep-alive":          true,
+	"proxy-authenticate":  true,
+	"proxy-authorization": true,
+	"te":                  true,
+	"trailers":            true,
+	"transfer-encoding":   true,
+	"upgrade":             true,
+	"proxy-connection":    true,
+}
 
-// proxyGRPCToOrigin 把 CF 边缘的 gRPC/h2 流以 h2c 转到本机 sing-box（全局连接复用）。
+// 全局 h2c Transport：多路复用到本机 gRPC。
+// 参考 cloudflared：gRPC 需要及时 flush，但用 32KiB 块而不是每字节一帧。
+var grpcH2cTransport = &http2.Transport{
+	AllowHTTP: true,
+	// AllowHTTP 时可用 http:// URL；DialTLSContext 仍用于建立底层连接
+	DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+		d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+		return d.DialContext(ctx, network, addr)
+	},
+	ReadIdleTimeout: 30 * time.Second,
+	PingTimeout:     10 * time.Second,
+	// 略增并发 stream，测速会开很多子连接
+	MaxHeaderListSize: 262144,
+}
+
+// proxyGRPCToOrigin 将 CF 边缘的 gRPC 流以 h2c 转到本机 VLESS-gRPC。
+// 不用 ReverseProxy 默认行为：手动 RoundTrip + 分块 flush，便于控制帧大小与 trailer。
 func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 	grpcAddr := fmt.Sprintf("127.0.0.1:%d", singBoxGRPCListenPort)
-	targetURL, _ := url.Parse(fmt.Sprintf("https://%s", grpcAddr))
 
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	proxy.Transport = grpcH2cTransport
-	
-	// 不设置 FlushInterval = -1，让 Go 自动管理缓冲。
-	// 避免在测速时产生海量极小的数据包触发 Cloudflare 的 HTTP/2 DDOS 防护机制导致断流。
+	outReq := r.Clone(r.Context())
+	outReq.URL = &url.URL{
+		Scheme:   "http", // AllowHTTP=true 的 h2c；勿用 https 以免部分路径走错
+		Host:     grpcAddr,
+		Path:     r.URL.Path,
+		RawPath:  r.URL.RawPath,
+		RawQuery: r.URL.RawQuery,
+	}
+	outReq.RequestURI = ""
+	outReq.Host = grpcAddr
+	// 流式 body：不要预设 ContentLength 缓冲整包
+	if outReq.Body == nil {
+		outReq.Body = http.NoBody
+	}
 
-	// 自动完美处理 HTTP/2 全双工双向流，并且会自动把后端返回的 Trailer 正确传递！
-	proxy.ServeHTTP(w, r)
+	for h := range grpcHopHeaders {
+		outReq.Header.Del(h)
+	}
+	// 删除可能由 CF 注入、干扰本机 h2c 的头
+	outReq.Header.Del("Cf-Cloudflared-Proxy-Connection-Upgrade")
+
+	resp, err := grpcH2cTransport.RoundTrip(outReq)
+	if err != nil {
+		grpcH2cTransport.CloseIdleConnections()
+		w.WriteHeader(http.StatusBadGateway)
+		return fmt.Errorf("h2c RoundTrip %s: %w", grpcAddr, err)
+	}
+	defer resp.Body.Close()
+
+	for h := range grpcHopHeaders {
+		resp.Header.Del(h)
+	}
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	// 预先声明 trailer，否则写完 body 后再加无效
+	if len(resp.Trailer) > 0 {
+		for k := range resp.Trailer {
+			w.Header().Add("Trailer", k)
+		}
+	}
+
+	w.WriteHeader(resp.StatusCode)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	// 32KiB 分块读+flush：兼顾 gRPC 流式及时性与测速时不要每字节一帧
+	buf := make([]byte, 32*1024)
+	for {
+		nr, er := resp.Body.Read(buf)
+		if nr > 0 {
+			nw, ew := w.Write(buf[:nr])
+			if ew != nil {
+				grpcH2cTransport.CloseIdleConnections()
+				return fmt.Errorf("write to edge: %w", ew)
+			}
+			if nw != nr {
+				return io.ErrShortWrite
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+		if er != nil {
+			if er != io.EOF && r.Context().Err() == nil {
+				grpcH2cTransport.CloseIdleConnections()
+				return fmt.Errorf("read origin: %w", er)
+			}
+			break
+		}
+	}
+
+	for k, vv := range resp.Trailer {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
 	return nil
 }
 
