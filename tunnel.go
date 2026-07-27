@@ -508,124 +508,38 @@ var grpcHopHeaders = map[string]bool{
 	"proxy-connection":    true,
 }
 
-// 全局 h2c Transport：多路复用到本机 gRPC�?
-// 参�?cloudflared：gRPC 需要及�?flush，但�?32KiB 块而不是每字节一帧�?
+// 全局 h2c Transport：多路复用到本机 gRPC?
+// 参?cloudflared：gRPC 需要及?flush，但?32KiB 块而不是每字节一帧?
 var grpcH2cTransport = &http2.Transport{
 	AllowHTTP: true,
-	// AllowHTTP 时可�?http:// URL；DialTLSContext 仍用于建立底层连�?
+	// AllowHTTP 时可?http:// URL；DialTLSContext 仍用于建立底层连?
 	DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
 		d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
 		return d.DialContext(ctx, network, addr)
 	},
 	ReadIdleTimeout: 30 * time.Second,
 	PingTimeout:     10 * time.Second,
-	// 略增并发 stream，测速会开很多子连�?
+	// 略增并发 stream，测速会开很多子连?
 	MaxHeaderListSize: 262144,
 }
 
-// proxyGRPCToOrigin �?CF 边缘�?gRPC 流以 h2c 转到本机 VLESS-gRPC�?
-// 手动 RoundTrip + 32KiB 分块 flush；详细字�?耗时由调用方 gRPC# 日志汇总�?
+// proxyGRPCToOrigin 将 CF 边缘的 gRPC 流以 h2c 转到本机 VLESS-gRPC。
 func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 	grpcAddr := fmt.Sprintf("127.0.0.1:%d", singBoxGRPCListenPort)
-	t0 := time.Now()
+	targetURL, _ := url.Parse(fmt.Sprintf("http://%s", grpcAddr))
 
-	outReq := r.Clone(r.Context())
-	outReq.URL = &url.URL{
-		Scheme:   "http", // AllowHTTP=true �?h2c
-		Host:     grpcAddr,
-		Path:     r.URL.Path,
-		RawPath:  r.URL.RawPath,
-		RawQuery: r.URL.RawQuery,
-	}
-	outReq.RequestURI = ""
-	outReq.Host = grpcAddr
-	if outReq.Body == nil {
-		outReq.Body = http.NoBody
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	proxy.Transport = grpcH2cTransport
+	
+	// ⭐️ 核心修复：10毫秒缓冲，防止小数据帧海量齐发触发CF的DDOS封锁 ⭐️
+	proxy.FlushInterval = 10 * time.Millisecond 
+
+	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+		tunnelLog.Printf("[TUNNEL] gRPC proxy error to origin: %v", err)
+		rw.WriteHeader(http.StatusBadGateway)
 	}
 
-	for h := range grpcHopHeaders {
-		outReq.Header.Del(h)
-	}
-	outReq.Header.Del("Cf-Cloudflared-Proxy-Connection-Upgrade")
-	// gRPC 强制需要；CF 或 hop 清理后可能丢失
-	outReq.Header.Set("TE", "trailers")
-	if outReq.Header.Get("Content-Type") == "" {
-		outReq.Header.Set("Content-Type", "application/grpc")
-	}
-
-	resp, err := grpcH2cTransport.RoundTrip(outReq)
-	headersDur := time.Since(t0).Round(time.Millisecond)
-	if err != nil {
-		grpcH2cTransport.CloseIdleConnections()
-		w.WriteHeader(http.StatusBadGateway)
-		return fmt.Errorf("h2c RoundTrip %s after %s: %w", grpcAddr, headersDur, err)
-	}
-	defer resp.Body.Close()
-
-	tunnelLog.Printf("[TUNNEL] gRPC origin headers status=%d dur=%s ct=%q",
-		resp.StatusCode, headersDur, resp.Header.Get("Content-Type"))
-
-	for h := range grpcHopHeaders {
-		resp.Header.Del(h)
-	}
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-	if len(resp.Trailer) > 0 {
-		for k := range resp.Trailer {
-			w.Header().Add("Trailer", k)
-		}
-	}
-
-	w.WriteHeader(resp.StatusCode)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-
-	var written int64
-	buf := make([]byte, 32*1024)
-	for {
-		nr, er := resp.Body.Read(buf)
-		if nr > 0 {
-			nw, ew := w.Write(buf[:nr])
-			if nw > 0 {
-				written += int64(nw)
-			}
-			if ew != nil {
-				grpcH2cTransport.CloseIdleConnections()
-				return fmt.Errorf("write to edge after %d bytes: %w", written, ew)
-			}
-			if nw != nr {
-				return fmt.Errorf("short write to edge after %d bytes", written)
-			}
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-		}
-		if er != nil {
-			if er == io.EOF {
-				break
-			}
-			if r.Context().Err() != nil {
-				return fmt.Errorf("edge canceled after %d bytes: %w (ctx=%v)", written, er, r.Context().Err())
-			}
-			grpcH2cTransport.CloseIdleConnections()
-			return fmt.Errorf("read origin after %d bytes: %w", written, er)
-		}
-	}
-
-	for k, vv := range resp.Trailer {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-	tunnelLog.Printf("[TUNNEL] gRPC body done bytes=%d bodyDur=%s totalDur=%s",
-		written,
-		time.Since(t0).Round(time.Millisecond)-headersDur,
-		time.Since(t0).Round(time.Millisecond),
-	)
+	proxy.ServeHTTP(w, r)
 	return nil
 }
 
