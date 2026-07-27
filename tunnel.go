@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -24,9 +25,12 @@ import (
 	"golang.org/x/net/http2"
 )
 
+// tunnelLog always writes tunnel diagnostics to stderr (captured in app.log).
+var tunnelLog = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile)
+
 // gRPC 诊断：并发流计数 + 单调 id，方便对照「测速挂」时间点
 var (
-	grpcStreamSeq atomic.Uint64
+	grpcStreamSeq  atomic.Uint64
 	grpcStreamLive atomic.Int64
 )
 
@@ -183,7 +187,7 @@ func capnpRegisterConnection(questionID, bsQuestionID uint32, accountTag string,
 func startCFTunnel() {
 	tokenDataBytes, err := base64.StdEncoding.DecodeString(CFToken)
 	if err != nil {
-		log.Printf("[ERROR] Invalid CF Tunnel Token: %v", err)
+		tunnelLog.Printf("[ERROR] Invalid CF Tunnel Token: %v", err)
 		return
 	}
 
@@ -193,7 +197,7 @@ func startCFTunnel() {
 		T string `json:"t"`
 	}
 	if err := json.Unmarshal(tokenDataBytes, &tokenData); err != nil {
-		log.Printf("[ERROR] CF Tunnel Token parse error: %v", err)
+		tunnelLog.Printf("[ERROR] CF Tunnel Token parse error: %v", err)
 		return
 	}
 
@@ -214,7 +218,7 @@ func cfTunnelLoop(connIndex uint8, accountTag string, tunnelSecret, tunnelID []b
 	for {
 		err := cfTunnelConnect(connIndex, accountTag, tunnelSecret, tunnelID)
 		if err != nil {
-			log.Printf("[TUNNEL] Conn[%d] closed: %v", connIndex, err)
+			tunnelLog.Printf("[TUNNEL] Conn[%d] closed: %v", connIndex, err)
 		}
 		time.Sleep(2 * time.Second)
 	}
@@ -240,7 +244,7 @@ func cfTunnelConnect(connIndex uint8, accountTag string, tunnelSecret, tunnelID 
 
 	// In Cloudflare Tunnel protocol, we dial the edge, but act as an HTTP/2 server!
 	// The edge sends requests (like control-stream) to us.
-	// ReadIdleTimeout 过短会在边缘静默时误杀整条 h2 连接（代理空闲/长视频间隙常见）
+	// ReadIdleTimeout 过短会在边缘静默时误杀整条 h2 连接（代理空�?长视频间隙常见）
 	server := &http2.Server{
 		ReadIdleTimeout: 5 * time.Minute,
 		IdleTimeout:     10 * time.Minute,
@@ -269,7 +273,7 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
-		log.Printf("[TUNNEL] Conn[%d] registered successfully", connIndex)
+		tunnelLog.Printf("[TUNNEL] Conn[%d] registered successfully", connIndex)
 		// 保持 control stream 存活
 		for {
 			select {
@@ -299,34 +303,34 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 	isGRPC := strings.HasPrefix(ct, "application/grpc") ||
 		strings.Contains(pathLower, "/"+svcName+"/")
 
-	// 总入口：任何非 control 请求都先打一行，失败也能看见「有没有进来、被判成啥」
+	// 总入口：任何�?control 请求都先打一行，失败也能看见「有没有进来、被判成啥�?
 	branch := "http"
 	if isWebSocket {
 		branch = "ws"
 	} else if isGRPC {
 		branch = "grpc"
 	}
-	log.Printf("[TUNNEL] IN conn=%d branch=%s method=%s path=%s ct=%q upgrade=%q cf-upgrade=%q proto=%s host=%s",
+	tunnelLog.Printf("[TUNNEL] IN conn=%d branch=%s method=%s path=%s ct=%q upgrade=%q cf-upgrade=%q proto=%s host=%s",
 		connIndex, branch, r.Method, r.URL.RequestURI(), ctRaw,
 		r.Header.Get("Upgrade"), r.Header.Get("Cf-Cloudflared-Proxy-Connection-Upgrade"),
 		r.Proto, r.Host,
 	)
 
 	if isWebSocket {
-		// ---- WebSocket 代理 → Web 端口（再桥到 sing-box WS）----
-		wsID := grpcStreamSeq.Add(1) // 复用计数器仅作 id
+		// ---- WebSocket 代理 �?Web 端口（再桥到 sing-box WS�?---
+		wsID := grpcStreamSeq.Add(1) // 复用计数器仅�?id
 		wsStart := time.Now()
-		log.Printf("[TUNNEL] WS#%d start conn=%d path=%s cl=%s",
+		tunnelLog.Printf("[TUNNEL] WS#%d start conn=%d path=%s cl=%s",
 			wsID, connIndex, r.URL.RequestURI(), r.Header.Get("Content-Length"))
 		localConn, err := net.Dial("tcp", webAddr)
 		if err != nil {
-			log.Printf("[TUNNEL] WS#%d dial web failed: %v", wsID, err)
+			tunnelLog.Printf("[TUNNEL] WS#%d dial web failed: %v", wsID, err)
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
 		defer localConn.Close()
 		defer func() {
-			log.Printf("[TUNNEL] WS#%d end dur=%s", wsID, time.Since(wsStart).Round(time.Millisecond))
+			tunnelLog.Printf("[TUNNEL] WS#%d end dur=%s", wsID, time.Since(wsStart).Round(time.Millisecond))
 		}()
 
 		// 重建 HTTP/1.1 升级请求
@@ -365,14 +369,14 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 		reqBuf.WriteString("Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
 		localConn.Write([]byte(reqBuf.String()))
 
-		// 读取本地 HTTP/1.1 响应头
+		// 读取本地 HTTP/1.1 响应�?
 		br := bufio.NewReader(localConn)
 		resp, err := http.ReadResponse(br, r)
 		if err != nil {
 			return
 		}
 
-		// 转发响应头给 CF 边缘（101 -> 200）
+		// 转发响应头给 CF 边缘�?01 -> 200�?
 		for k, vv := range resp.Header {
 			kLower := strings.ToLower(k)
 			if kLower == "connection" || kLower == "upgrade" || kLower == "transfer-encoding" || kLower == "keep-alive" {
@@ -415,7 +419,7 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 	if isGRPC {
 		// ---- gRPC 流式代理：不 ReadAll，对本机 h2c 转到 VLESS-gRPC 端口 ----
 		if singBoxGRPCListenPort == 0 {
-			log.Printf("[TUNNEL] gRPC drop: GRPC_PORT off path=%s ct=%q method=%s",
+			tunnelLog.Printf("[TUNNEL] gRPC drop: GRPC_PORT off path=%s ct=%q method=%s",
 				r.URL.RequestURI(), r.Header.Get("Content-Type"), r.Method)
 			w.WriteHeader(http.StatusBadGateway)
 			return
@@ -423,7 +427,7 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 		id := grpcStreamSeq.Add(1)
 		live := grpcStreamLive.Add(1)
 		start := time.Now()
-		log.Printf("[TUNNEL] gRPC#%d START live=%d conn=%d → 127.0.0.1:%d method=%s path=%s ct=%q te=%q cl=%s proto=%s",
+		tunnelLog.Printf("[TUNNEL] gRPC#%d START live=%d conn=%d �?127.0.0.1:%d method=%s path=%s ct=%q te=%q cl=%s proto=%s",
 			id, live, connIndex, singBoxGRPCListenPort,
 			r.Method, r.URL.RequestURI(),
 			r.Header.Get("Content-Type"),
@@ -435,22 +439,22 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 		live = grpcStreamLive.Add(-1)
 		dur := time.Since(start).Round(time.Millisecond)
 		if err != nil {
-			log.Printf("[TUNNEL] gRPC#%d FAIL live=%d dur=%s path=%s err=%v",
+			tunnelLog.Printf("[TUNNEL] gRPC#%d FAIL live=%d dur=%s path=%s err=%v",
 				id, live, dur, r.URL.RequestURI(), err)
 		} else {
-			log.Printf("[TUNNEL] gRPC#%d OK live=%d dur=%s path=%s",
+			tunnelLog.Printf("[TUNNEL] gRPC#%d OK live=%d dur=%s path=%s",
 				id, live, dur, r.URL.RequestURI())
 		}
 		return
 	}
 
-	// 非 WS/非 gRPC：打一条采样日志，避免完全盲（仅 DEBUG 时已全局打开则每条都记可能刷屏，这里只记可疑长请求）
+	// �?WS/�?gRPC：打一条采样日志，避免完全盲（�?DEBUG 时已全局打开则每条都记可能刷屏，这里只记可疑长请求）
 	if r.Method == http.MethodPost || r.Header.Get("Content-Type") != "" {
-		log.Printf("[TUNNEL] HTTP other conn=%d method=%s path=%s ct=%q cl=%s",
+		tunnelLog.Printf("[TUNNEL] HTTP other conn=%d method=%s path=%s ct=%q cl=%s",
 			connIndex, r.Method, r.URL.RequestURI(), r.Header.Get("Content-Type"), r.Header.Get("Content-Length"))
 	}
 
-	// ---- 普通 HTTP 代理（主页、订阅等）→ Web 端口 ----
+	// ---- 普�?HTTP 代理（主页、订阅等）→ Web 端口 ----
 	bodyData, _ := io.ReadAll(r.Body)
 	targetURL := fmt.Sprintf("http://%s%s", webAddr, r.URL.RequestURI())
 	proxyReq, err := http.NewRequest(r.Method, targetURL, bytes.NewReader(bodyData))
@@ -491,43 +495,43 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 	io.Copy(w, resp.Body)
 }
 
-// hop-by-hop 头，反代时必须剥掉（RFC 7230）
+// hop-by-hop 头，反代时必须剥掉（RFC 7230�?
+// 不要删除 te：gRPC 需要 TE: trailers（删掉客户端会像完全没反应）
+// hop-by-hop 头。不要删 te：gRPC 需要 TE: trailers
 var grpcHopHeaders = map[string]bool{
 	"connection":          true,
 	"keep-alive":          true,
 	"proxy-authenticate":  true,
 	"proxy-authorization": true,
-	"te":                  true,
-	"trailers":            true,
 	"transfer-encoding":   true,
 	"upgrade":             true,
 	"proxy-connection":    true,
 }
 
-// 全局 h2c Transport：多路复用到本机 gRPC。
-// 参考 cloudflared：gRPC 需要及时 flush，但用 32KiB 块而不是每字节一帧。
+// 全局 h2c Transport：多路复用到本机 gRPC�?
+// 参�?cloudflared：gRPC 需要及�?flush，但�?32KiB 块而不是每字节一帧�?
 var grpcH2cTransport = &http2.Transport{
 	AllowHTTP: true,
-	// AllowHTTP 时可用 http:// URL；DialTLSContext 仍用于建立底层连接
+	// AllowHTTP 时可�?http:// URL；DialTLSContext 仍用于建立底层连�?
 	DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
 		d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
 		return d.DialContext(ctx, network, addr)
 	},
 	ReadIdleTimeout: 30 * time.Second,
 	PingTimeout:     10 * time.Second,
-	// 略增并发 stream，测速会开很多子连接
+	// 略增并发 stream，测速会开很多子连�?
 	MaxHeaderListSize: 262144,
 }
 
-// proxyGRPCToOrigin 将 CF 边缘的 gRPC 流以 h2c 转到本机 VLESS-gRPC。
-// 手动 RoundTrip + 32KiB 分块 flush；详细字节/耗时由调用方 gRPC# 日志汇总。
+// proxyGRPCToOrigin �?CF 边缘�?gRPC 流以 h2c 转到本机 VLESS-gRPC�?
+// 手动 RoundTrip + 32KiB 分块 flush；详细字�?耗时由调用方 gRPC# 日志汇总�?
 func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 	grpcAddr := fmt.Sprintf("127.0.0.1:%d", singBoxGRPCListenPort)
 	t0 := time.Now()
 
 	outReq := r.Clone(r.Context())
 	outReq.URL = &url.URL{
-		Scheme:   "http", // AllowHTTP=true 的 h2c
+		Scheme:   "http", // AllowHTTP=true �?h2c
 		Host:     grpcAddr,
 		Path:     r.URL.Path,
 		RawPath:  r.URL.RawPath,
@@ -543,6 +547,11 @@ func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 		outReq.Header.Del(h)
 	}
 	outReq.Header.Del("Cf-Cloudflared-Proxy-Connection-Upgrade")
+	// gRPC 强制需要；CF 或 hop 清理后可能丢失
+	outReq.Header.Set("TE", "trailers")
+	if outReq.Header.Get("Content-Type") == "" {
+		outReq.Header.Set("Content-Type", "application/grpc")
+	}
 
 	resp, err := grpcH2cTransport.RoundTrip(outReq)
 	headersDur := time.Since(t0).Round(time.Millisecond)
@@ -553,7 +562,7 @@ func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 	}
 	defer resp.Body.Close()
 
-	log.Printf("[TUNNEL] gRPC origin headers status=%d dur=%s ct=%q",
+	tunnelLog.Printf("[TUNNEL] gRPC origin headers status=%d dur=%s ct=%q",
 		resp.StatusCode, headersDur, resp.Header.Get("Content-Type"))
 
 	for h := range grpcHopHeaders {
@@ -612,7 +621,7 @@ func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 			w.Header().Add(k, v)
 		}
 	}
-	log.Printf("[TUNNEL] gRPC body done bytes=%d bodyDur=%s totalDur=%s",
+	tunnelLog.Printf("[TUNNEL] gRPC body done bytes=%d bodyDur=%s totalDur=%s",
 		written,
 		time.Since(t0).Round(time.Millisecond)-headersDur,
 		time.Since(t0).Round(time.Millisecond),
