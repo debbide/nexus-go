@@ -272,16 +272,19 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 		}
 	}
 
-	localAddr := "127.0.0.1:" + PORT
+	webAddr := "127.0.0.1:" + PORT
 	upgradeHint := strings.ToLower(r.Header.Get("Cf-Cloudflared-Proxy-Connection-Upgrade"))
 	isWebSocket := upgradeHint == "websocket" ||
 		r.Header.Get("Sec-Websocket-Key") != "" ||
 		r.Header.Get("Sec-WebSocket-Key") != "" ||
 		strings.ToLower(r.Header.Get("Upgrade")) == "websocket"
+	ct := strings.ToLower(r.Header.Get("Content-Type"))
+	isGRPC := strings.HasPrefix(ct, "application/grpc") ||
+		strings.Contains(strings.ToLower(r.URL.Path), "/"+strings.ToLower(GRPCServiceName)+"/")
 
 	if isWebSocket {
-		// ---- WebSocket 代理 ----
-		localConn, err := net.Dial("tcp", localAddr)
+		// ---- WebSocket 代理 → Web 端口（再桥到 sing-box WS）----
+		localConn, err := net.Dial("tcp", webAddr)
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
 			return
@@ -368,20 +371,23 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 		case <-done:
 		case <-r.Context().Done():
 		}
+		return
+	}
 
-	} else {
-		// ---- 普通 HTTP 代理（主页、订阅等）----
-		// 读取请求体
-		bodyData, _ := io.ReadAll(r.Body)
-
-		// 构建转发请求
-		targetURL := fmt.Sprintf("http://%s%s", localAddr, r.URL.RequestURI())
-		proxyReq, err := http.NewRequest(r.Method, targetURL, bytes.NewReader(bodyData))
+	if isGRPC {
+		// ---- gRPC 流式代理：不 ReadAll，对本机 h2c 转到 VLESS-gRPC 端口 ----
+		if singBoxGRPCListenPort == 0 {
+			log.Printf("[TUNNEL] gRPC request but GRPC_PORT not enabled")
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		grpcAddr := fmt.Sprintf("127.0.0.1:%d", singBoxGRPCListenPort)
+		targetURL := fmt.Sprintf("http://%s%s", grpcAddr, r.URL.RequestURI())
+		proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
-
 		for k, vv := range r.Header {
 			kLower := strings.ToLower(k)
 			if kLower == "host" {
@@ -393,29 +399,94 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 		}
 		proxyReq.Host = r.Host
 
-		httpClient := &http.Client{
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}
-		resp, err := httpClient.Do(proxyReq)
+		resp, err := grpcOriginClient.Do(proxyReq)
 		if err != nil {
+			log.Printf("[TUNNEL] gRPC h2c dial failed: %v", err)
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
 		defer resp.Body.Close()
 
-		// 转发响应头
 		for k, vv := range resp.Header {
 			for _, v := range vv {
 				w.Header().Add(k, v)
 			}
 		}
+		// 声明 trailer 键，便于部分客户端
+		if len(resp.Trailer) > 0 {
+			keys := make([]string, 0, len(resp.Trailer))
+			for k := range resp.Trailer {
+				keys = append(keys, k)
+			}
+			w.Header().Set("Trailer", strings.Join(keys, ", "))
+		}
 		w.WriteHeader(resp.StatusCode)
-
-		// 转发响应体
-		io.Copy(w, resp.Body)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		io.Copy(flushWriter{w: w}, resp.Body)
+		for k, vv := range resp.Trailer {
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+		return
 	}
+
+	// ---- 普通 HTTP 代理（主页、订阅等）→ Web 端口 ----
+	bodyData, _ := io.ReadAll(r.Body)
+	targetURL := fmt.Sprintf("http://%s%s", webAddr, r.URL.RequestURI())
+	proxyReq, err := http.NewRequest(r.Method, targetURL, bytes.NewReader(bodyData))
+	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+
+	for k, vv := range r.Header {
+		kLower := strings.ToLower(k)
+		if kLower == "host" {
+			continue
+		}
+		for _, v := range vv {
+			proxyReq.Header.Add(k, v)
+		}
+	}
+	proxyReq.Host = r.Host
+
+	httpClient := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := httpClient.Do(proxyReq)
+	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+// grpcOriginClient：对本机 VLESS-gRPC（h2c）的流式客户端，Transport 全局复用
+var grpcOriginClient = &http.Client{
+	Transport: &http2.Transport{
+		AllowHTTP: true,
+		// 明文 h2：DialTLS 直接返回 TCP（h2c）
+		DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
+			return net.Dial(network, addr)
+		},
+	},
+	// gRPC 长连接，不设短 Timeout；靠请求 Context 取消
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
 }
 
 func newWebSocketKey() string {

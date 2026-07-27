@@ -179,6 +179,8 @@ load_env_defaults() {
   ENV_UDP_IPV6_ONLY="${ENV_UDP_IPV6_ONLY:-${UDP_IPV6_ONLY:-false}}"
   ENV_FANOUT_EXITS="${ENV_FANOUT_EXITS:-${FANOUT_EXITS:-}}"
   ENV_FANOUT_PATH_PREFIX="${ENV_FANOUT_PATH_PREFIX:-${FANOUT_PATH_PREFIX:-fo}}"
+  ENV_GRPC_PORT="${ENV_GRPC_PORT:-${GRPC_PORT:-}}"
+  ENV_GRPC_SERVICE_NAME="${ENV_GRPC_SERVICE_NAME:-${GRPC_SERVICE_NAME:-GunService}}"
   ENV_DEBUG="${ENV_DEBUG:-${DEBUG:-true}}"
 
   # 重装时尽量沿用旧 PORT，避免无意义换端口
@@ -269,8 +271,16 @@ ask_config() {
   read -r input </dev/tty
   ENV_FANOUT_PATH_PREFIX="${input:-${ENV_FANOUT_PATH_PREFIX:-fo}}"
 
+  printf "17. GRPC_PORT (VLESS-gRPC 端口，留空禁用；官方隧道可指 127.0.0.1:该端口) [%s]: " "${ENV_GRPC_PORT:-}"
+  read -r input </dev/tty
+  ENV_GRPC_PORT="${input:-${ENV_GRPC_PORT:-}}"
+
+  printf "18. GRPC_SERVICE_NAME (gRPC serviceName，默认 GunService) [%s]: " "${ENV_GRPC_SERVICE_NAME:-GunService}"
+  read -r input </dev/tty
+  ENV_GRPC_SERVICE_NAME="${input:-${ENV_GRPC_SERVICE_NAME:-GunService}}"
+
   # DEBUG 日志开关：默认开启，方便出问题时排查
-  printf "17. DEBUG (是否记录运行日志，出问题好排查) [%s]: " "${ENV_DEBUG:-true}"
+  printf "19. DEBUG (是否记录运行日志，出问题好排查) [%s]: " "${ENV_DEBUG:-true}"
   read -r input </dev/tty
   ENV_DEBUG="${input:-${ENV_DEBUG:-true}}"
 
@@ -313,6 +323,8 @@ create_env_file() {
     printf 'UDP_IPV6_ONLY=%s\n' "$(quote_env_value "${ENV_UDP_IPV6_ONLY:-false}")"
     printf 'FANOUT_EXITS=%s\n' "$(quote_env_value "${ENV_FANOUT_EXITS:-}")"
     printf 'FANOUT_PATH_PREFIX=%s\n' "$(quote_env_value "${ENV_FANOUT_PATH_PREFIX:-fo}")"
+    printf 'GRPC_PORT=%s\n' "$(quote_env_value "${ENV_GRPC_PORT:-}")"
+    printf 'GRPC_SERVICE_NAME=%s\n' "$(quote_env_value "${ENV_GRPC_SERVICE_NAME:-GunService}")"
     printf 'DEBUG=%s\n' "$(quote_env_value "${ENV_DEBUG:-true}")"
   } > "${APP_ENV}"
 }

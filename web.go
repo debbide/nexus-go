@@ -262,6 +262,14 @@ func handleSubscription(w http.ResponseWriter, r *http.Request) {
 		subscription += "\n" + cfVlessURL
 	}
 
+	// VLESS-gRPC：直连本机端口 +（可选）CF 域名（手搓隧道 h2c 回源 / 官方 tunnel 指端口）
+	if singBoxGRPCListenPort > 0 {
+		subscription += "\n" + buildGRPCURL(namePart+"-gRPC", false)
+		if CFDomain != "" {
+			subscription += "\n" + buildGRPCURL(namePart+"-CF-gRPC", true)
+		}
+	}
+
 	// fanout 旁路节点：一国一条，走独立 path → 对应 SOCKS 出口；主节点不受影响
 	for _, ex := range getFanoutExits() {
 		if ex.ListenPort == 0 {
@@ -328,6 +336,34 @@ func buildHY2URL(name string) string {
 		HY2Port,
 		query.Encode(),
 		url.QueryEscape(name),
+	)
+}
+
+// buildGRPCURL 生成 VLESS-gRPC 分享链接。
+// viaCF=true 时用 CFDomain:443 + TLS（边缘终结 TLS，源站 h2c）。
+func buildGRPCURL(name string, viaCF bool) string {
+	svc := GRPCServiceName
+	if svc == "" {
+		svc = "GunService"
+	}
+	if viaCF && CFDomain != "" {
+		return fmt.Sprintf(
+			"vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=grpc&serviceName=%s&mode=gun#%s",
+			UUID, CFDomain, CFDomain, url.QueryEscape(svc), url.QueryEscape(name),
+		)
+	}
+	// 直连：公网 IP + GRPC 端口，无 TLS（客户端 insecure / security=none）
+	host := currentDomain
+	if host == "" || host == "change-your-domain.com" {
+		if ip := fetchPublicIPv4(); ip != "" {
+			host = ip
+		} else {
+			host = "YOUR_SERVER_IP"
+		}
+	}
+	return fmt.Sprintf(
+		"vless://%s@%s:%d?encryption=none&security=none&type=grpc&serviceName=%s&mode=gun#%s",
+		UUID, formatURIHost(host), singBoxGRPCListenPort, url.QueryEscape(svc), url.QueryEscape(name),
 	)
 }
 

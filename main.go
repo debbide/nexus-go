@@ -39,8 +39,11 @@ var (
 	// UDPIPv6Only=true 时 TUIC/HY2 仅监听本机全局 IPv6（真·v6 only）；false 为 [::] 双栈
 	UDPIPv6Only bool
 	// FanoutExitsRaw 例: jp:127.0.0.1:11080,us:11081 ；空则不启用旁路
-	FanoutExitsRaw  string
+	FanoutExitsRaw   string
 	FanoutPathPrefix string
+	// GRPCPort 非空则启用本机 VLESS-gRPC（h2c，供手搓隧道/官方隧道回源）
+	GRPCPort        string
+	GRPCServiceName string
 
 	AutoAccess                 bool
 	NezhaTLS                   bool
@@ -114,6 +117,11 @@ func initEnv() {
 	FanoutPathPrefix = os.Getenv("FANOUT_PATH_PREFIX")
 	if FanoutPathPrefix == "" {
 		FanoutPathPrefix = "fo"
+	}
+	GRPCPort = strings.TrimSpace(os.Getenv("GRPC_PORT"))
+	GRPCServiceName = strings.TrimSpace(os.Getenv("GRPC_SERVICE_NAME"))
+	if GRPCServiceName == "" {
+		GRPCServiceName = "GunService"
 	}
 	Debug = envBool("DEBUG", false)
 

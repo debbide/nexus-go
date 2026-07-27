@@ -40,6 +40,9 @@ const (
 // singBoxVLESSListenPort 在启动时动态分配，避免多实例端口冲突
 var singBoxVLESSListenPort uint16
 
+// singBoxGRPCListenPort 本机 VLESS-gRPC（h2c）端口；0 表示未启用
+var singBoxGRPCListenPort uint16
+
 func findFreeLocalPort() (uint16, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -90,6 +93,48 @@ func startSingBoxRuntime() (*singBoxRuntime, error) {
 				},
 			},
 		},
+	}
+
+	// VLESS-gRPC：本机 h2c（无 TLS），供手搓隧道流式反代 / 官方 cloudflared 回源 / IP 直连
+	if GRPCPort != "" && GRPCPort != "0" {
+		grpcPort, err := parseUint16Port(GRPCPort)
+		if err != nil {
+			return nil, fmt.Errorf("invalid GRPC_PORT: %w", err)
+		}
+		// 与 Web PORT 冲突时换空闲端口
+		if strconv.Itoa(int(grpcPort)) == PORT || !isPortAvailable(strconv.Itoa(int(grpcPort))) {
+			alt, aerr := findFreeLocalPort()
+			if aerr != nil {
+				return nil, fmt.Errorf("GRPC_PORT %d busy and no free port: %w", grpcPort, aerr)
+			}
+			log.Printf("[WARN] GRPC_PORT %d unavailable, using %d", grpcPort, alt)
+			grpcPort = alt
+		}
+		singBoxGRPCListenPort = grpcPort
+		// 监听 0.0.0.0：直连 IP:端口 + 本机 127.0.0.1 隧道回源均可
+		listenAllTCP := badoption.Addr(netip.IPv4Unspecified())
+		inbounds = append(inbounds, option.Inbound{
+			Type: constant.TypeVLESS,
+			Tag:  "vless-grpc-in",
+			Options: &option.VLESSInboundOptions{
+				ListenOptions: option.ListenOptions{
+					Listen:     &listenAllTCP,
+					ListenPort: grpcPort,
+				},
+				Users: []option.VLESSUser{
+					{Name: singBoxTUICDefaultName + "-grpc", UUID: UUID},
+				},
+				// 无 TLS：本地 h2c。CF 域名 TLS 在边缘终结。
+				// ForceLite：使用 grpclite（h2c），与隧道 http2.Transport h2c 对齐
+				Transport: &option.V2RayTransportOptions{
+					Type: constant.V2RayTransportTypeGRPC,
+					GRPCOptions: option.V2RayGRPCOptions{
+						ServiceName: GRPCServiceName,
+						ForceLite:   true,
+					},
+				},
+			},
+		})
 	}
 
 	if TUICPort != "" && TUICPort != "0" {
@@ -271,6 +316,9 @@ func startSingBoxRuntime() (*singBoxRuntime, error) {
 		return nil, err
 	}
 	parts := []string{fmt.Sprintf("vless-ws=127.0.0.1:%d%s", singBoxVLESSListenPort, singBoxVLESSPath())}
+	if singBoxGRPCListenPort > 0 {
+		parts = append(parts, fmt.Sprintf("vless-grpc=0.0.0.0:%d(h2c,service=%s)", singBoxGRPCListenPort, GRPCServiceName))
+	}
 	if TUICPort != "" && TUICPort != "0" {
 		parts = append(parts, fmt.Sprintf("tuic=%s:%s(%s)", listenUDPLabel, TUICPort, listenMode))
 	}

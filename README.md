@@ -31,6 +31,15 @@ Nexus-Go 是一个轻量级的后端服务程序。本项目集成了基础网�
 | `HY2_PASSWORD` | HY2 认证密码 | 同 `UUID` |
 | `HY2_OBFS_PASSWORD` | HY2 salamander 混淆密码，留空不启用混淆 | 无 |
 | `UDP_IPV6_ONLY` | `true` 时 TUIC/HY2 **仅监听本机全局 IPv6**（真·v6 only，IPv4 连不上）；`false` 为 `[::]` **双栈** | `false` |
+| `GRPC_PORT` | VLESS-gRPC 本机监听端口（h2c，无 TLS）；留空禁用 | 无 |
+| `GRPC_SERVICE_NAME` | gRPC serviceName（客户端一致） | `GunService` |
+
+> **VLESS-gRPC**  
+> - 本机：`0.0.0.0:GRPC_PORT`，**明文 h2c**（方便手搓隧道 / 官方 cloudflared 回源）。  
+> - 手搓 `CF_TUNNEL_TOKEN`：隧道识别 `application/grpc` 后流式 h2c 转到该端口（勿指到 Web `PORT`）。  
+> - 官方隧道：Public Hostname → `http://127.0.0.1:GRPC_PORT`。  
+> - 订阅：直连一行 + 有 `CF_DOMAIN` 时多一行 `*-CF-gRPC`（443 + TLS，边缘终结）。  
+> - 客户端：`type=grpc`，`serviceName` 与 `GRPC_SERVICE_NAME` 一致。
 
 > **TUIC / HY2 监听**  
 > - 默认 `UDP_IPV6_ONLY=false`：绑 `[::]`，常见 Linux 下为**双栈**。  
