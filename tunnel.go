@@ -15,6 +15,8 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"time"
 
@@ -455,59 +457,16 @@ var (
 // proxyGRPCToOrigin 把 CF 边缘的 gRPC/h2 流以 h2c 转到本机 sing-box（全局连接复用）。
 func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 	grpcAddr := fmt.Sprintf("127.0.0.1:%d", singBoxGRPCListenPort)
-	targetURL := fmt.Sprintf("http://%s%s", grpcAddr, r.URL.RequestURI())
+	targetURL, _ := url.Parse(fmt.Sprintf("http://%s", grpcAddr))
 
-	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
-	if err != nil {
-		w.WriteHeader(http.StatusBadGateway)
-		return err
-	}
-	for k, vv := range r.Header {
-		if strings.ToLower(k) == "host" {
-			continue
-		}
-		for _, v := range vv {
-			proxyReq.Header.Add(k, v)
-		}
-	}
-	proxyReq.Host = r.Host
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	proxy.Transport = grpcH2cTransport
+	// 极其关键：-1 表示彻底关闭反代的缓冲，有数据立刻 Flush 到客户端。
+	// gRPC 这种双向流对实时性要求极高，如果缓冲会导致握手或者心跳卡死。
+	proxy.FlushInterval = -1 
 
-	resp, err := grpcH2cClient.Do(proxyReq)
-	if err != nil {
-		// 池内可能有坏连接：清掉后让后续请求重建（本请求 body 可能已消耗，无法安全重放）
-		grpcH2cTransport.CloseIdleConnections()
-		w.WriteHeader(http.StatusBadGateway)
-		return fmt.Errorf("h2c to %s: %w", grpcAddr, err)
-	}
-	defer resp.Body.Close()
-
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-	if len(resp.Trailer) > 0 {
-		keys := make([]string, 0, len(resp.Trailer))
-		for k := range resp.Trailer {
-			keys = append(keys, k)
-		}
-		w.Header().Set("Trailer", strings.Join(keys, ", "))
-	}
-	w.WriteHeader(resp.StatusCode)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-
-	_, copyErr := io.Copy(flushWriter{w: w}, resp.Body)
-	for k, vv := range resp.Trailer {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-	if copyErr != nil && r.Context().Err() == nil {
-		grpcH2cTransport.CloseIdleConnections()
-		return fmt.Errorf("copy response: %w", copyErr)
-	}
+	// 自动完美处理 HTTP/2 全双工双向流，并且会自动把后端返回的 Trailer 正确传递！
+	proxy.ServeHTTP(w, r)
 	return nil
 }
 
