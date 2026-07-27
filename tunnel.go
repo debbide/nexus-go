@@ -514,9 +514,24 @@ var grpcH2cTransport = &http2.Transport{
 		d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
 		return d.DialContext(ctx, network, addr)
 	},
-	ReadIdleTimeout:   30 * time.Second,
-	PingTimeout:       10 * time.Second,
+	ReadIdleTimeout:   3 * time.Minute,
+	PingTimeout:       15 * time.Second,
 	MaxHeaderListSize: 262144,
+}
+
+// isConnError returns true only for transport-level failures that warrant
+// clearing the h2c connection pool. Stream-level errors (context cancel,
+// EOF on a single stream) must NOT trigger CloseIdleConnections, or every
+// concurrent speed-test stream will be torn down at once.
+func isConnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "dial tcp")
 }
 
 // proxyGRPCToOrigin uses std ReverseProxy for full-duplex body + trailers.
@@ -534,9 +549,10 @@ func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 	// 10ms batching: stream promptly without 1-byte HTTP/2 frames to CF edge.
 	proxy.FlushInterval = 10 * time.Millisecond
 	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, e error) {
-		grpcH2cTransport.CloseIdleConnections()
+		if isConnError(e) {
+			grpcH2cTransport.CloseIdleConnections()
+		}
 		tunnelLog.Printf("[TUNNEL] gRPC ReverseProxy error path=%s: %v", req.URL.RequestURI(), e)
-		// May already have written headers; best-effort 502.
 		rw.WriteHeader(http.StatusBadGateway)
 	}
 	origDirector := proxy.Director
