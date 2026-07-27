@@ -232,8 +232,10 @@ func cfTunnelConnect(connIndex uint8, accountTag string, tunnelSecret, tunnelID 
 
 	// In Cloudflare Tunnel protocol, we dial the edge, but act as an HTTP/2 server!
 	// The edge sends requests (like control-stream) to us.
+	// ReadIdleTimeout 过短会在边缘静默时误杀整条 h2 连接（代理空闲/长视频间隙常见）
 	server := &http2.Server{
-		ReadIdleTimeout: 30 * time.Second,
+		ReadIdleTimeout: 5 * time.Minute,
+		IdleTimeout:     10 * time.Minute,
 	}
 	server.ServeConn(conn, &http2.ServeConnOpts{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -430,30 +432,30 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 	io.Copy(w, resp.Body)
 }
 
-// proxyGRPCToOrigin 把 CF 边缘的 gRPC/h2 流以 h2c 转到本机 sing-box。
-// 每次请求使用独立 http2.Transport，不跨请求复用到 127.0.0.1 的连接。
-// 本机回源极便宜；复用池在 CF 长连场景下更容易「先通后断」（半死 h2 被复用）。
-func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
-	grpcAddr := fmt.Sprintf("127.0.0.1:%d", singBoxGRPCListenPort)
-	targetURL := fmt.Sprintf("http://%s%s", grpcAddr, r.URL.RequestURI())
-
-	tr := &http2.Transport{
+// 全局唯一 h2c Transport：多路复用到本机 gRPC，避免每请求新建 TCP 打满 FD/端口。
+// ReadIdleTimeout+PingTimeout：空闲发 PING，踢掉半死连接（解决「先通后断」复用脏连接）。
+var (
+	grpcH2cTransport = &http2.Transport{
 		AllowHTTP: true,
 		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-			var d net.Dialer
+			d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
 			return d.DialContext(ctx, network, addr)
 		},
 		ReadIdleTimeout: 30 * time.Second,
 		PingTimeout:     10 * time.Second,
 	}
-	defer tr.CloseIdleConnections()
-
-	client := &http.Client{
-		Transport: tr,
+	grpcH2cClient = &http.Client{
+		Transport: grpcH2cTransport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
+)
+
+// proxyGRPCToOrigin 把 CF 边缘的 gRPC/h2 流以 h2c 转到本机 sing-box（全局连接复用）。
+func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
+	grpcAddr := fmt.Sprintf("127.0.0.1:%d", singBoxGRPCListenPort)
+	targetURL := fmt.Sprintf("http://%s%s", grpcAddr, r.URL.RequestURI())
 
 	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
 	if err != nil {
@@ -470,8 +472,10 @@ func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 	}
 	proxyReq.Host = r.Host
 
-	resp, err := client.Do(proxyReq)
+	resp, err := grpcH2cClient.Do(proxyReq)
 	if err != nil {
+		// 池内可能有坏连接：清掉后让后续请求重建（本请求 body 可能已消耗，无法安全重放）
+		grpcH2cTransport.CloseIdleConnections()
 		w.WriteHeader(http.StatusBadGateway)
 		return fmt.Errorf("h2c to %s: %w", grpcAddr, err)
 	}
@@ -501,6 +505,7 @@ func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 	if copyErr != nil && r.Context().Err() == nil {
+		grpcH2cTransport.CloseIdleConnections()
 		return fmt.Errorf("copy response: %w", copyErr)
 	}
 	return nil
