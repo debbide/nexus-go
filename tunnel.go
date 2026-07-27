@@ -17,10 +17,17 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"golang.org/x/net/http2"
+)
+
+// gRPC 诊断：并发流计数 + 单调 id，方便对照「测速挂」时间点
+var (
+	grpcStreamSeq atomic.Uint64
+	grpcStreamLive atomic.Int64
 )
 
 type capnpMessage struct {
@@ -283,17 +290,30 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 		r.Header.Get("Sec-WebSocket-Key") != "" ||
 		strings.ToLower(r.Header.Get("Upgrade")) == "websocket"
 	ct := strings.ToLower(r.Header.Get("Content-Type"))
+	svcName := strings.ToLower(GRPCServiceName)
+	if svcName == "" {
+		svcName = "gunservice"
+	}
+	pathLower := strings.ToLower(r.URL.Path)
 	isGRPC := strings.HasPrefix(ct, "application/grpc") ||
-		strings.Contains(strings.ToLower(r.URL.Path), "/"+strings.ToLower(GRPCServiceName)+"/")
+		strings.Contains(pathLower, "/"+svcName+"/")
 
 	if isWebSocket {
 		// ---- WebSocket 代理 → Web 端口（再桥到 sing-box WS）----
+		wsID := grpcStreamSeq.Add(1) // 复用计数器仅作 id
+		wsStart := time.Now()
+		log.Printf("[TUNNEL] WS#%d start conn=%d path=%s cl=%s",
+			wsID, connIndex, r.URL.RequestURI(), r.Header.Get("Content-Length"))
 		localConn, err := net.Dial("tcp", webAddr)
 		if err != nil {
+			log.Printf("[TUNNEL] WS#%d dial web failed: %v", wsID, err)
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
 		defer localConn.Close()
+		defer func() {
+			log.Printf("[TUNNEL] WS#%d end dur=%s", wsID, time.Since(wsStart).Round(time.Millisecond))
+		}()
 
 		// 重建 HTTP/1.1 升级请求
 		var reqBuf strings.Builder
@@ -381,15 +401,39 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 	if isGRPC {
 		// ---- gRPC 流式代理：不 ReadAll，对本机 h2c 转到 VLESS-gRPC 端口 ----
 		if singBoxGRPCListenPort == 0 {
-			log.Printf("[TUNNEL] gRPC request but GRPC_PORT not enabled path=%s", r.URL.RequestURI())
+			log.Printf("[TUNNEL] gRPC drop: GRPC_PORT off path=%s ct=%q method=%s",
+				r.URL.RequestURI(), r.Header.Get("Content-Type"), r.Method)
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
-		log.Printf("[TUNNEL] gRPC stream via CF → 127.0.0.1:%d path=%s", singBoxGRPCListenPort, r.URL.RequestURI())
-		if err := proxyGRPCToOrigin(w, r); err != nil {
-			log.Printf("[TUNNEL] gRPC proxy error path=%s: %v", r.URL.RequestURI(), err)
+		id := grpcStreamSeq.Add(1)
+		live := grpcStreamLive.Add(1)
+		start := time.Now()
+		log.Printf("[TUNNEL] gRPC#%d START live=%d conn=%d → 127.0.0.1:%d method=%s path=%s ct=%q te=%q cl=%s proto=%s",
+			id, live, connIndex, singBoxGRPCListenPort,
+			r.Method, r.URL.RequestURI(),
+			r.Header.Get("Content-Type"),
+			r.Header.Get("Transfer-Encoding"),
+			r.Header.Get("Content-Length"),
+			r.Proto,
+		)
+		err := proxyGRPCToOrigin(w, r)
+		live = grpcStreamLive.Add(-1)
+		dur := time.Since(start).Round(time.Millisecond)
+		if err != nil {
+			log.Printf("[TUNNEL] gRPC#%d FAIL live=%d dur=%s path=%s err=%v",
+				id, live, dur, r.URL.RequestURI(), err)
+		} else {
+			log.Printf("[TUNNEL] gRPC#%d OK live=%d dur=%s path=%s",
+				id, live, dur, r.URL.RequestURI())
 		}
 		return
+	}
+
+	// 非 WS/非 gRPC：打一条采样日志，避免完全盲（仅 DEBUG 时已全局打开则每条都记可能刷屏，这里只记可疑长请求）
+	if r.Method == http.MethodPost || r.Header.Get("Content-Type") != "" {
+		log.Printf("[TUNNEL] HTTP other conn=%d method=%s path=%s ct=%q cl=%s",
+			connIndex, r.Method, r.URL.RequestURI(), r.Header.Get("Content-Type"), r.Header.Get("Content-Length"))
 	}
 
 	// ---- 普通 HTTP 代理（主页、订阅等）→ Web 端口 ----
@@ -462,13 +506,14 @@ var grpcH2cTransport = &http2.Transport{
 }
 
 // proxyGRPCToOrigin 将 CF 边缘的 gRPC 流以 h2c 转到本机 VLESS-gRPC。
-// 不用 ReverseProxy 默认行为：手动 RoundTrip + 分块 flush，便于控制帧大小与 trailer。
+// 手动 RoundTrip + 32KiB 分块 flush；详细字节/耗时由调用方 gRPC# 日志汇总。
 func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 	grpcAddr := fmt.Sprintf("127.0.0.1:%d", singBoxGRPCListenPort)
+	t0 := time.Now()
 
 	outReq := r.Clone(r.Context())
 	outReq.URL = &url.URL{
-		Scheme:   "http", // AllowHTTP=true 的 h2c；勿用 https 以免部分路径走错
+		Scheme:   "http", // AllowHTTP=true 的 h2c
 		Host:     grpcAddr,
 		Path:     r.URL.Path,
 		RawPath:  r.URL.RawPath,
@@ -476,7 +521,6 @@ func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 	}
 	outReq.RequestURI = ""
 	outReq.Host = grpcAddr
-	// 流式 body：不要预设 ContentLength 缓冲整包
 	if outReq.Body == nil {
 		outReq.Body = http.NoBody
 	}
@@ -484,16 +528,19 @@ func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 	for h := range grpcHopHeaders {
 		outReq.Header.Del(h)
 	}
-	// 删除可能由 CF 注入、干扰本机 h2c 的头
 	outReq.Header.Del("Cf-Cloudflared-Proxy-Connection-Upgrade")
 
 	resp, err := grpcH2cTransport.RoundTrip(outReq)
+	headersDur := time.Since(t0).Round(time.Millisecond)
 	if err != nil {
 		grpcH2cTransport.CloseIdleConnections()
 		w.WriteHeader(http.StatusBadGateway)
-		return fmt.Errorf("h2c RoundTrip %s: %w", grpcAddr, err)
+		return fmt.Errorf("h2c RoundTrip %s after %s: %w", grpcAddr, headersDur, err)
 	}
 	defer resp.Body.Close()
+
+	log.Printf("[TUNNEL] gRPC origin headers status=%d dur=%s ct=%q",
+		resp.StatusCode, headersDur, resp.Header.Get("Content-Type"))
 
 	for h := range grpcHopHeaders {
 		resp.Header.Del(h)
@@ -503,7 +550,6 @@ func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 			w.Header().Add(k, v)
 		}
 	}
-	// 预先声明 trailer，否则写完 body 后再加无效
 	if len(resp.Trailer) > 0 {
 		for k := range resp.Trailer {
 			w.Header().Add("Trailer", k)
@@ -515,29 +561,35 @@ func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 		f.Flush()
 	}
 
-	// 32KiB 分块读+flush：兼顾 gRPC 流式及时性与测速时不要每字节一帧
+	var written int64
 	buf := make([]byte, 32*1024)
 	for {
 		nr, er := resp.Body.Read(buf)
 		if nr > 0 {
 			nw, ew := w.Write(buf[:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
 			if ew != nil {
 				grpcH2cTransport.CloseIdleConnections()
-				return fmt.Errorf("write to edge: %w", ew)
+				return fmt.Errorf("write to edge after %d bytes: %w", written, ew)
 			}
 			if nw != nr {
-				return io.ErrShortWrite
+				return fmt.Errorf("short write to edge after %d bytes", written)
 			}
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
 		}
 		if er != nil {
-			if er != io.EOF && r.Context().Err() == nil {
-				grpcH2cTransport.CloseIdleConnections()
-				return fmt.Errorf("read origin: %w", er)
+			if er == io.EOF {
+				break
 			}
-			break
+			if r.Context().Err() != nil {
+				return fmt.Errorf("edge canceled after %d bytes: %w (ctx=%v)", written, er, r.Context().Err())
+			}
+			grpcH2cTransport.CloseIdleConnections()
+			return fmt.Errorf("read origin after %d bytes: %w", written, er)
 		}
 	}
 
@@ -546,6 +598,11 @@ func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 			w.Header().Add(k, v)
 		}
 	}
+	log.Printf("[TUNNEL] gRPC body done bytes=%d bodyDur=%s totalDur=%s",
+		written,
+		time.Since(t0).Round(time.Millisecond)-headersDur,
+		time.Since(t0).Round(time.Millisecond),
+	)
 	return nil
 }
 
