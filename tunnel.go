@@ -15,6 +15,8 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -517,120 +519,65 @@ var grpcH2cTransport = &http2.Transport{
 	MaxHeaderListSize: 262144,
 }
 
-// proxyGRPCToOrigin forwards CF-edge gRPC streams to local h2c sing-box.
-// Request body is streamed via pipe while response body is copied to the edge.
+// proxyGRPCToOrigin uses std ReverseProxy for full-duplex body + trailers.
+// Keep TE: trailers; strip CF inject headers; flush every 10ms (not every byte).
 func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 	grpcAddr := fmt.Sprintf("127.0.0.1:%d", singBoxGRPCListenPort)
-	t0 := time.Now()
-
-	pr, pw := io.Pipe()
-	go func() {
-		var err error
-		if r.Body != nil {
-			_, err = io.Copy(pw, r.Body)
-		}
-		if err != nil {
-			_ = pw.CloseWithError(err)
-			return
-		}
-		_ = pw.Close()
-	}()
-
-	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, "http://"+grpcAddr+r.URL.RequestURI(), pr)
+	target, err := url.Parse("http://" + grpcAddr)
 	if err != nil {
-		_ = pr.Close()
 		w.WriteHeader(http.StatusBadGateway)
 		return err
 	}
-	for k, vv := range r.Header {
-		lk := strings.ToLower(k)
-		if grpcHopHeaders[lk] || strings.HasPrefix(lk, "cf-") || lk == "host" {
-			continue
-		}
-		for _, v := range vv {
-			outReq.Header.Add(k, v)
-		}
-	}
-	outReq.Header.Set("TE", "trailers")
-	outReq.Header.Set("Content-Type", "application/grpc")
-	outReq.Host = grpcAddr
-	outReq.ContentLength = -1
 
-	resp, err := grpcH2cTransport.RoundTrip(outReq)
-	headersDur := time.Since(t0).Round(time.Millisecond)
-	if err != nil {
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Transport = grpcH2cTransport
+	// 10ms batching: stream promptly without 1-byte HTTP/2 frames to CF edge.
+	proxy.FlushInterval = 10 * time.Millisecond
+	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, e error) {
 		grpcH2cTransport.CloseIdleConnections()
-		w.WriteHeader(http.StatusBadGateway)
-		return fmt.Errorf("h2c RoundTrip %s after %s: %w", grpcAddr, headersDur, err)
+		tunnelLog.Printf("[TUNNEL] gRPC ReverseProxy error path=%s: %v", req.URL.RequestURI(), e)
+		// May already have written headers; best-effort 502.
+		rw.WriteHeader(http.StatusBadGateway)
 	}
-	defer resp.Body.Close()
-
-	tunnelLog.Printf("[TUNNEL] gRPC origin headers status=%d dur=%s ct=%q",
-		resp.StatusCode, headersDur, resp.Header.Get("Content-Type"))
-
-	for h := range grpcHopHeaders {
-		resp.Header.Del(h)
-	}
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
+	origDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		origDirector(req)
+		req.Host = grpcAddr
+		for h := range grpcHopHeaders {
+			req.Header.Del(h)
 		}
-	}
-	// net/http requires Trailer names before WriteHeader.
-	w.Header().Add("Trailer", "Grpc-Status")
-	w.Header().Add("Trailer", "Grpc-Message")
-	for k := range resp.Trailer {
-		w.Header().Add("Trailer", k)
-	}
-
-	w.WriteHeader(resp.StatusCode)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-
-	var written int64
-	buf := make([]byte, 32*1024)
-	for {
-		nr, er := resp.Body.Read(buf)
-		if nr > 0 {
-			nw, ew := w.Write(buf[:nr])
-			if nw > 0 {
-				written += int64(nw)
-			}
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-			if ew != nil {
-				grpcH2cTransport.CloseIdleConnections()
-				return fmt.Errorf("write to edge after %d bytes: %w", written, ew)
-			}
-			if nw != nr {
-				return fmt.Errorf("short write to edge after %d bytes", written)
+		// Drop Cloudflare injects that confuse origin.
+		for k := range req.Header {
+			if strings.HasPrefix(strings.ToLower(k), "cf-") {
+				req.Header.Del(k)
 			}
 		}
-		if er != nil {
-			if er == io.EOF {
-				break
-			}
-			if r.Context().Err() != nil {
-				return fmt.Errorf("edge canceled after %d bytes: %w (ctx=%v)", written, er, r.Context().Err())
-			}
-			grpcH2cTransport.CloseIdleConnections()
-			return fmt.Errorf("read origin after %d bytes: %w", written, er)
+		req.Header.Set("TE", "trailers")
+		if req.Header.Get("Content-Type") == "" {
+			req.Header.Set("Content-Type", "application/grpc")
 		}
+		// Streaming body.
+		req.ContentLength = -1
+	}
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		for h := range grpcHopHeaders {
+			resp.Header.Del(h)
+		}
+		// Ensure trailer declaration for gRPC status.
+		if resp.Header.Get("Trailer") == "" {
+			resp.Header.Add("Trailer", "Grpc-Status")
+			resp.Header.Add("Trailer", "Grpc-Message")
+		}
+		tunnelLog.Printf("[TUNNEL] gRPC origin headers status=%d ct=%q",
+			resp.StatusCode, resp.Header.Get("Content-Type"))
+		return nil
 	}
 
-	for k, vv := range resp.Trailer {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
+	// Capture cancel as failure for logs (ServeHTTP itself doesn't return error).
+	proxy.ServeHTTP(w, r)
+	if err := r.Context().Err(); err != nil {
+		return fmt.Errorf("edge canceled: %w", err)
 	}
-
-	tunnelLog.Printf("[TUNNEL] gRPC body done bytes=%d bodyDur=%s totalDur=%s",
-		written,
-		time.Since(t0).Round(time.Millisecond)-headersDur,
-		time.Since(t0).Round(time.Millisecond),
-	)
 	return nil
 }
 
