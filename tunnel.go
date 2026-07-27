@@ -16,7 +16,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -383,10 +382,9 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
+		log.Printf("[TUNNEL] gRPC stream via CF → 127.0.0.1:%d path=%s", singBoxGRPCListenPort, r.URL.RequestURI())
 		if err := proxyGRPCToOrigin(w, r); err != nil {
 			log.Printf("[TUNNEL] gRPC proxy error path=%s: %v", r.URL.RequestURI(), err)
-			// 若还未写响应头，返回 502
-			// WriteHeader 可能已调用；忽略二次写
 		}
 		return
 	}
@@ -432,63 +430,50 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 	io.Copy(w, resp.Body)
 }
 
-// grpcH2cTransport 对本机 VLESS-gRPC（grpclite h2c）复用连接；用 ping 探活，避免池里死连接导致「先通后断」。
-var (
-	grpcH2cTransport = &http2.Transport{
+// proxyGRPCToOrigin 把 CF 边缘的 gRPC/h2 流以 h2c 转到本机 sing-box。
+// 每次请求使用独立 http2.Transport，不跨请求复用到 127.0.0.1 的连接。
+// 本机回源极便宜；复用池在 CF 长连场景下更容易「先通后断」（半死 h2 被复用）。
+func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
+	grpcAddr := fmt.Sprintf("127.0.0.1:%d", singBoxGRPCListenPort)
+	targetURL := fmt.Sprintf("http://%s%s", grpcAddr, r.URL.RequestURI())
+
+	tr := &http2.Transport{
 		AllowHTTP: true,
 		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, network, addr)
 		},
-		// 空闲时发 PING，发现半死 TCP 后丢掉连接（CF 长连场景常见）
-		ReadIdleTimeout: 20 * time.Second,
+		ReadIdleTimeout: 30 * time.Second,
 		PingTimeout:     10 * time.Second,
 	}
-	grpcOriginClient = &http.Client{
-		Transport: grpcH2cTransport,
+	defer tr.CloseIdleConnections()
+
+	client := &http.Client{
+		Transport: tr,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
-	grpcProxyMu sync.Mutex
-)
 
-func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
-	grpcAddr := fmt.Sprintf("127.0.0.1:%d", singBoxGRPCListenPort)
-	targetURL := fmt.Sprintf("http://%s%s", grpcAddr, r.URL.RequestURI())
-
-	doOnce := func() (*http.Response, error) {
-		proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
-		if err != nil {
-			return nil, err
-		}
-		for k, vv := range r.Header {
-			kLower := strings.ToLower(k)
-			if kLower == "host" {
-				continue
-			}
-			for _, v := range vv {
-				proxyReq.Header.Add(k, v)
-			}
-		}
-		proxyReq.Host = r.Host
-		return grpcOriginClient.Do(proxyReq)
-	}
-
-	resp, err := doOnce()
+	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
 	if err != nil {
-		// 池内可能是死连接：清掉空闲 h2 连接后重试一次
-		log.Printf("[TUNNEL] gRPC h2c first try failed, clearing idle conns: %v", err)
-		grpcProxyMu.Lock()
-		grpcH2cTransport.CloseIdleConnections()
-		grpcProxyMu.Unlock()
-		// Body 可能已被部分消费，仅当仍可读时重试意义有限；
-		// 对尚未开始读的失败（拨号/协议）重试有效。
-		if r.Body != nil && r.Context().Err() == nil {
-			// 无法安全重放已读 body；仅当错误像连接层时客户端会自行重试新 stream
-		}
 		w.WriteHeader(http.StatusBadGateway)
 		return err
+	}
+	for k, vv := range r.Header {
+		if strings.ToLower(k) == "host" {
+			continue
+		}
+		for _, v := range vv {
+			proxyReq.Header.Add(k, v)
+		}
+	}
+	proxyReq.Host = r.Host
+
+	resp, err := client.Do(proxyReq)
+	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		return fmt.Errorf("h2c to %s: %w", grpcAddr, err)
 	}
 	defer resp.Body.Close()
 
@@ -516,8 +501,6 @@ func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 	if copyErr != nil && r.Context().Err() == nil {
-		// 复制中途失败：清连接池，避免后续 stream 复用坏连接
-		grpcH2cTransport.CloseIdleConnections()
 		return fmt.Errorf("copy response: %w", copyErr)
 	}
 	return nil
