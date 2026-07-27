@@ -33,6 +33,24 @@ var (
 	grpcStreamLive atomic.Int64
 )
 
+// tunnelConns holds the active CF-edge TCP connections keyed by connIndex.
+// Closing one causes http2.Server.ServeConn to return, triggering cfTunnelLoop reconnect.
+var tunnelConns [4]atomic.Pointer[net.Conn]
+
+func storeTunnelConn(idx uint8, c net.Conn) { tunnelConns[idx].Store(&c) }
+func clearTunnelConn(idx uint8)             { tunnelConns[idx].Store(nil) }
+
+// reconnectAllTunnels closes every active CF tunnel connection so cfTunnelLoop
+// immediately re-dials and re-registers fresh connections with the CF edge.
+func reconnectAllTunnels() {
+	for i := range tunnelConns {
+		if p := tunnelConns[i].Load(); p != nil {
+			(*p).Close()
+		}
+	}
+	tunnelLog.Printf("[TUNNEL] reconnect triggered: closed all edge connections for re-registration")
+}
+
 type capnpMessage struct {
 	words []uint64
 }
@@ -240,6 +258,8 @@ func cfTunnelConnect(connIndex uint8, accountTag string, tunnelSecret, tunnelID 
 		return err
 	}
 	defer conn.Close()
+	storeTunnelConn(connIndex, conn)
+	defer clearTunnelConn(connIndex)
 
 	// In Cloudflare Tunnel protocol, we dial the edge, but act as an HTTP/2 server!
 	// The edge sends requests (like control-stream) to us.
@@ -441,7 +461,9 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 		// the next stream gets a fresh connection with a full flow-control window.
 		// During a burst (live>0) only throttle to avoid cascade teardown.
 		if live == 0 {
-			grpcH2cTransport.CloseIdleConnections()
+			grpcTransport().CloseIdleConnections()
+			newGRPCTransport()
+			go reconnectAllTunnels()
 		} else {
 			throttledCloseIdle()
 		}
@@ -513,16 +535,29 @@ var grpcHopHeaders = map[string]bool{
 	"proxy-connection":    true,
 }
 
-// Shared h2c transport to local VLESS-gRPC (grpclite).
-var grpcH2cTransport = &http2.Transport{
-	AllowHTTP: true,
-	DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-		d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
-		return d.DialContext(ctx, network, addr)
-	},
-	ReadIdleTimeout:   3 * time.Minute,
-	PingTimeout:       15 * time.Second,
-	MaxHeaderListSize: 262144,
+// grpcH2cTransport is replaced atomically after a speed-test burst ends.
+var grpcH2cTransportPtr atomic.Pointer[http2.Transport]
+
+func newGRPCTransport() *http2.Transport {
+	t := &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+			d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+			return d.DialContext(ctx, network, addr)
+		},
+		ReadIdleTimeout:   3 * time.Minute,
+		PingTimeout:       15 * time.Second,
+		MaxHeaderListSize: 262144,
+	}
+	grpcH2cTransportPtr.Store(t)
+	return t
+}
+
+func grpcTransport() *http2.Transport {
+	if t := grpcH2cTransportPtr.Load(); t != nil {
+		return t
+	}
+	return newGRPCTransport()
 }
 
 // isConnError returns true only for transport-level failures that warrant
@@ -549,7 +584,7 @@ func throttledCloseIdle() {
 	now := time.Now().UnixMilli()
 	last := lastIdleClose.Load()
 	if now-last > 1000 && lastIdleClose.CompareAndSwap(last, now) {
-		grpcH2cTransport.CloseIdleConnections()
+		grpcTransport().CloseIdleConnections()
 	}
 }
 
@@ -580,10 +615,10 @@ func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 		outReq.Header.Set("Content-Type", "application/grpc")
 	}
 
-	resp, err := grpcH2cTransport.RoundTrip(outReq)
+	resp, err := grpcTransport().RoundTrip(outReq)
 	if err != nil {
 		if isConnError(err) {
-			grpcH2cTransport.CloseIdleConnections()
+			grpcTransport().CloseIdleConnections()
 		}
 		tunnelLog.Printf("[TUNNEL] gRPC RoundTrip error path=%s: %v", r.URL.RequestURI(), err)
 		w.WriteHeader(http.StatusBadGateway)
