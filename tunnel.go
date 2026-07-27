@@ -15,8 +15,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -534,63 +532,84 @@ func isConnError(err error) bool {
 		strings.Contains(s, "dial tcp")
 }
 
-// proxyGRPCToOrigin uses std ReverseProxy for full-duplex body + trailers.
-// Keep TE: trailers; strip CF inject headers; flush every 10ms (not every byte).
+// lastIdleClose throttles CloseIdleConnections to at most once per second,
+// preventing cascade teardown during speed tests while still flushing stale
+// h2c connections after each stream ends.
+var lastIdleClose atomic.Int64
+
+func throttledCloseIdle() {
+	now := time.Now().UnixMilli()
+	last := lastIdleClose.Load()
+	if now-last > 1000 && lastIdleClose.CompareAndSwap(last, now) {
+		grpcH2cTransport.CloseIdleConnections()
+	}
+}
+
+// proxyGRPCToOrigin proxies gRPC to the local h2c origin using direct RoundTrip,
+// matching cloudflared's own approach (no ReverseProxy — avoids h2→h2 body/trailer bugs).
 func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 	grpcAddr := fmt.Sprintf("127.0.0.1:%d", singBoxGRPCListenPort)
-	target, err := url.Parse("http://" + grpcAddr)
+
+	outReq, err := http.NewRequestWithContext(r.Context(), r.Method,
+		"http://"+grpcAddr+r.URL.RequestURI(), r.Body)
 	if err != nil {
 		w.WriteHeader(http.StatusBadGateway)
 		return err
 	}
+	outReq.Host = grpcAddr
+	outReq.ContentLength = -1
+	for k, vv := range r.Header {
+		kl := strings.ToLower(k)
+		if grpcHopHeaders[kl] || strings.HasPrefix(kl, "cf-") {
+			continue
+		}
+		for _, v := range vv {
+			outReq.Header.Add(k, v)
+		}
+	}
+	outReq.Header.Set("TE", "trailers")
+	if outReq.Header.Get("Content-Type") == "" {
+		outReq.Header.Set("Content-Type", "application/grpc")
+	}
 
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.Transport = grpcH2cTransport
-	// 10ms batching: stream promptly without 1-byte HTTP/2 frames to CF edge.
-	proxy.FlushInterval = 10 * time.Millisecond
-	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, e error) {
-		if isConnError(e) {
+	resp, err := grpcH2cTransport.RoundTrip(outReq)
+	if err != nil {
+		if isConnError(err) {
 			grpcH2cTransport.CloseIdleConnections()
 		}
-		tunnelLog.Printf("[TUNNEL] gRPC ReverseProxy error path=%s: %v", req.URL.RequestURI(), e)
-		rw.WriteHeader(http.StatusBadGateway)
+		tunnelLog.Printf("[TUNNEL] gRPC RoundTrip error path=%s: %v", r.URL.RequestURI(), err)
+		w.WriteHeader(http.StatusBadGateway)
+		return err
 	}
-	origDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		origDirector(req)
-		req.Host = grpcAddr
-		for h := range grpcHopHeaders {
-			req.Header.Del(h)
-		}
-		// Drop Cloudflare injects that confuse origin.
-		for k := range req.Header {
-			if strings.HasPrefix(strings.ToLower(k), "cf-") {
-				req.Header.Del(k)
-			}
-		}
-		req.Header.Set("TE", "trailers")
-		if req.Header.Get("Content-Type") == "" {
-			req.Header.Set("Content-Type", "application/grpc")
-		}
-		// Streaming body.
-		req.ContentLength = -1
-	}
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		for h := range grpcHopHeaders {
-			resp.Header.Del(h)
-		}
-		// Ensure trailer declaration for gRPC status.
-		if resp.Header.Get("Trailer") == "" {
-			resp.Header.Add("Trailer", "Grpc-Status")
-			resp.Header.Add("Trailer", "Grpc-Message")
-		}
-		tunnelLog.Printf("[TUNNEL] gRPC origin headers status=%d ct=%q",
-			resp.StatusCode, resp.Header.Get("Content-Type"))
-		return nil
-	}
+	defer resp.Body.Close()
 
-	// Capture cancel as failure for logs (ServeHTTP itself doesn't return error).
-	proxy.ServeHTTP(w, r)
+	for k, vv := range resp.Header {
+		if grpcHopHeaders[strings.ToLower(k)] {
+			continue
+		}
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	if w.Header().Get("Trailer") == "" {
+		w.Header().Add("Trailer", "Grpc-Status")
+		w.Header().Add("Trailer", "Grpc-Message")
+	}
+	tunnelLog.Printf("[TUNNEL] gRPC origin headers status=%d ct=%q",
+		resp.StatusCode, resp.Header.Get("Content-Type"))
+	w.WriteHeader(resp.StatusCode)
+
+	io.Copy(flushWriter{w: w}, resp.Body)
+
+	// Forward trailers (Grpc-Status, Grpc-Message).
+	for k, vv := range resp.Trailer {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 	if err := r.Context().Err(); err != nil {
 		return fmt.Errorf("edge canceled: %w", err)
 	}
