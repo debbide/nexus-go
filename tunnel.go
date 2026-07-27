@@ -461,9 +461,9 @@ func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
 	proxy.Transport = grpcH2cTransport
-	// 极其关键：-1 表示彻底关闭反代的缓冲，有数据立刻 Flush 到客户端。
-	// gRPC 这种双向流对实时性要求极高，如果缓冲会导致握手或者心跳卡死。
-	proxy.FlushInterval = -1 
+	
+	// 不设置 FlushInterval = -1，让 Go 自动管理缓冲。
+	// 避免在测速时产生海量极小的数据包触发 Cloudflare 的 HTTP/2 DDOS 防护机制导致断流。
 
 	// 自动完美处理 HTTP/2 全双工双向流，并且会自动把后端返回的 Trailer 正确传递！
 	proxy.ServeHTTP(w, r)
