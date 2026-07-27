@@ -457,7 +457,7 @@ var (
 // proxyGRPCToOrigin 把 CF 边缘的 gRPC/h2 流以 h2c 转到本机 sing-box（全局连接复用）。
 func proxyGRPCToOrigin(w http.ResponseWriter, r *http.Request) error {
 	grpcAddr := fmt.Sprintf("127.0.0.1:%d", singBoxGRPCListenPort)
-	targetURL, _ := url.Parse(fmt.Sprintf("http://%s", grpcAddr))
+	targetURL, _ := url.Parse(fmt.Sprintf("https://%s", grpcAddr))
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
 	proxy.Transport = grpcH2cTransport
