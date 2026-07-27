@@ -27,6 +27,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/direct"
 	"github.com/sagernet/sing-box/protocol/hysteria2"
+	"github.com/sagernet/sing-box/protocol/socks"
 	"github.com/sagernet/sing-box/protocol/tuic"
 	"github.com/sagernet/sing-box/protocol/vless"
 	"github.com/sagernet/sing/common/json/badoption"
@@ -171,6 +172,82 @@ func startSingBoxRuntime() (*singBoxRuntime, error) {
 		})
 	}
 
+	outbounds := []option.Outbound{
+		{
+			Type: constant.TypeDirect,
+			Tag:  "direct",
+			Options: &option.DirectOutboundOptions{
+				DialerOptions: option.DialerOptions{
+					ConnectTimeout: badoption.Duration(10 * time.Second),
+					TCPKeepAlive:   badoption.Duration(15 * time.Second),
+				},
+			},
+		},
+	}
+	var routeRules []option.Rule
+
+	// fanout 旁路：每国独立 VLESS-WS 入口 → 对应本机 SOCKS；主入口仍走 direct
+	fanoutExits := getFanoutExits()
+	for i := range fanoutExits {
+		ex := &fanoutExits[i]
+		foPort, err := findFreeLocalPort()
+		if err != nil {
+			return nil, fmt.Errorf("find free port for fanout %s: %w", ex.Code, err)
+		}
+		ex.ListenPort = foPort
+		inbounds = append(inbounds, option.Inbound{
+			Type: constant.TypeVLESS,
+			Tag:  ex.InboundTag,
+			Options: &option.VLESSInboundOptions{
+				ListenOptions: option.ListenOptions{
+					Listen:     &listenLocal,
+					ListenPort: foPort,
+				},
+				Users: []option.VLESSUser{
+					{Name: singBoxTUICDefaultName + "-fo-" + ex.Code, UUID: UUID},
+				},
+				Transport: &option.V2RayTransportOptions{
+					Type: constant.V2RayTransportTypeWebsocket,
+					WebsocketOptions: option.V2RayWebsocketOptions{
+						Path: "/" + trimPath(ex.Path),
+					},
+				},
+			},
+		})
+		outbounds = append(outbounds, option.Outbound{
+			Type: constant.TypeSOCKS,
+			Tag:  ex.OutboundTag,
+			Options: &option.SOCKSOutboundOptions{
+				ServerOptions: option.ServerOptions{
+					Server:     ex.SocksHost,
+					ServerPort: ex.SocksPort,
+				},
+				Version: "5",
+				DialerOptions: option.DialerOptions{
+					ConnectTimeout: badoption.Duration(10 * time.Second),
+					TCPKeepAlive:   badoption.Duration(15 * time.Second),
+				},
+			},
+		})
+		routeRules = append(routeRules, option.Rule{
+			Type: constant.RuleTypeDefault,
+			DefaultOptions: option.DefaultRule{
+				RawDefaultRule: option.RawDefaultRule{
+					Inbound: badoption.Listable[string]{ex.InboundTag},
+				},
+				RuleAction: option.RuleAction{
+					Action: constant.RuleActionTypeRoute,
+					RouteOptions: option.RouteActionOptions{
+						Outbound: ex.OutboundTag,
+					},
+				},
+			},
+		})
+	}
+	if len(fanoutExits) > 0 {
+		setFanoutExits(fanoutExits)
+	}
+
 	instance, err := box.New(box.Options{
 		Context: ctx,
 		Options: option.Options{
@@ -178,20 +255,12 @@ func startSingBoxRuntime() (*singBoxRuntime, error) {
 				Disabled: !Debug,
 				Level:    singBoxLogLevel(),
 			},
-			Inbounds: inbounds,
-			Outbounds: []option.Outbound{
-				{
-					Type: constant.TypeDirect,
-					Tag:  "direct",
-					Options: &option.DirectOutboundOptions{
-						DialerOptions: option.DialerOptions{
-							ConnectTimeout: badoption.Duration(10 * time.Second),
-							TCPKeepAlive:   badoption.Duration(15 * time.Second),
-						},
-					},
-				},
+			Inbounds:  inbounds,
+			Outbounds: outbounds,
+			Route: &option.RouteOptions{
+				Rules: routeRules,
+				Final: "direct",
 			},
-			Route: &option.RouteOptions{Final: "direct"},
 		},
 	})
 	if err != nil {
@@ -207,6 +276,9 @@ func startSingBoxRuntime() (*singBoxRuntime, error) {
 	}
 	if HY2Port != "" && HY2Port != "0" {
 		parts = append(parts, fmt.Sprintf("hy2=%s:%s(%s)", listenUDPLabel, HY2Port, listenMode))
+	}
+	for _, ex := range getFanoutExits() {
+		parts = append(parts, fmt.Sprintf("fanout-%s=127.0.0.1:%d/%s->%s:%d", ex.Code, ex.ListenPort, ex.Path, ex.SocksHost, ex.SocksPort))
 	}
 	log.Printf("[INFO] sing-box runtime started: %s", strings.Join(parts, " "))
 	return &singBoxRuntime{instance: instance}, nil
@@ -280,6 +352,7 @@ func minimalSingBoxContext(ctx context.Context) context.Context {
 
 	outboundRegistry := outbound.NewRegistry()
 	direct.RegisterOutbound(outboundRegistry)
+	socks.RegisterOutbound(outboundRegistry)
 
 	dnsRegistry := boxDNS.NewTransportRegistry()
 	local.RegisterTransport(dnsRegistry)

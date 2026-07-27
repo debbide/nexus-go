@@ -177,6 +177,8 @@ load_env_defaults() {
   ENV_HY2_DOMAIN="${ENV_HY2_DOMAIN:-${HY2_DOMAIN:-}}"
   ENV_HY2_OBFS_PASSWORD="${ENV_HY2_OBFS_PASSWORD:-${HY2_OBFS_PASSWORD:-}}"
   ENV_UDP_IPV6_ONLY="${ENV_UDP_IPV6_ONLY:-${UDP_IPV6_ONLY:-false}}"
+  ENV_FANOUT_EXITS="${ENV_FANOUT_EXITS:-${FANOUT_EXITS:-}}"
+  ENV_FANOUT_PATH_PREFIX="${ENV_FANOUT_PATH_PREFIX:-${FANOUT_PATH_PREFIX:-fo}}"
   ENV_DEBUG="${ENV_DEBUG:-${DEBUG:-true}}"
 
   # 重装时尽量沿用旧 PORT，避免无意义换端口
@@ -259,8 +261,16 @@ ask_config() {
   read -r input </dev/tty
   ENV_UDP_IPV6_ONLY="${input:-${ENV_UDP_IPV6_ONLY:-false}}"
 
+  printf "15. FANOUT_EXITS (旁路出口 jp:127.0.0.1:11080,us:11081 留空禁用) [%s]: " "${ENV_FANOUT_EXITS:-}"
+  read -r input </dev/tty
+  ENV_FANOUT_EXITS="${input:-${ENV_FANOUT_EXITS:-}}"
+
+  printf "16. FANOUT_PATH_PREFIX (旁路 path 前缀，默认 fo → /fo-jp) [%s]: " "${ENV_FANOUT_PATH_PREFIX:-fo}"
+  read -r input </dev/tty
+  ENV_FANOUT_PATH_PREFIX="${input:-${ENV_FANOUT_PATH_PREFIX:-fo}}"
+
   # DEBUG 日志开关：默认开启，方便出问题时排查
-  printf "15. DEBUG (是否记录运行日志，出问题好排查) [%s]: " "${ENV_DEBUG:-true}"
+  printf "17. DEBUG (是否记录运行日志，出问题好排查) [%s]: " "${ENV_DEBUG:-true}"
   read -r input </dev/tty
   ENV_DEBUG="${input:-${ENV_DEBUG:-true}}"
 
@@ -301,6 +311,8 @@ create_env_file() {
     printf 'HY2_DOMAIN=%s\n' "$(quote_env_value "${ENV_HY2_DOMAIN:-}")"
     printf 'HY2_OBFS_PASSWORD=%s\n' "$(quote_env_value "${ENV_HY2_OBFS_PASSWORD:-}")"
     printf 'UDP_IPV6_ONLY=%s\n' "$(quote_env_value "${ENV_UDP_IPV6_ONLY:-false}")"
+    printf 'FANOUT_EXITS=%s\n' "$(quote_env_value "${ENV_FANOUT_EXITS:-}")"
+    printf 'FANOUT_PATH_PREFIX=%s\n' "$(quote_env_value "${ENV_FANOUT_PATH_PREFIX:-fo}")"
     printf 'DEBUG=%s\n' "$(quote_env_value "${ENV_DEBUG:-true}")"
   } > "${APP_ENV}"
 }

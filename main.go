@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -37,6 +38,9 @@ var (
 	HY2ObfsPass  string
 	// UDPIPv6Only=true 时 TUIC/HY2 仅监听本机全局 IPv6（真·v6 only）；false 为 [::] 双栈
 	UDPIPv6Only bool
+	// FanoutExitsRaw 例: jp:127.0.0.1:11080,us:11081 ；空则不启用旁路
+	FanoutExitsRaw  string
+	FanoutPathPrefix string
 
 	AutoAccess                 bool
 	NezhaTLS                   bool
@@ -106,7 +110,19 @@ func initEnv() {
 	UDPIPv6Only = envBool("UDP_IPV6_ONLY", false) ||
 		envBool("HY2_IPV6_ONLY", false) ||
 		envBool("TUIC_IPV6_ONLY", false)
+	FanoutExitsRaw = strings.TrimSpace(os.Getenv("FANOUT_EXITS"))
+	FanoutPathPrefix = os.Getenv("FANOUT_PATH_PREFIX")
+	if FanoutPathPrefix == "" {
+		FanoutPathPrefix = "fo"
+	}
 	Debug = envBool("DEBUG", false)
+
+	if exits, err := parseFanoutExits(FanoutExitsRaw, FanoutPathPrefix); err != nil {
+		log.Printf("[WARN] FANOUT_EXITS ignored: %v", err)
+		setFanoutExits(nil)
+	} else {
+		setFanoutExits(exits)
+	}
 
 	target := resolveNezhaTarget(NezhaServer, NezhaPort)
 	NezhaTLS = envBool("NEZHA_TLS", tlsPorts[extractPort(target)])
@@ -129,7 +145,8 @@ func initEnv() {
 	NezhaUseIPv6CountryCode = envBool("NEZHA_USE_IPV6_COUNTRY_CODE", false)
 
 	configureLogging()
-	log.Printf("[INFO] Configuration loaded. PORT=%s, SUB_PATH=/%s, WSPATH=/%s", PORT, SubPath, WsPath)
+	log.Printf("[INFO] Configuration loaded. PORT=%s, SUB_PATH=/%s, WSPATH=/%s, fanout=%d", PORT, SubPath, WsPath, len(getFanoutExits()))
+	logFanoutSummary()
 }
 
 func configureLogging() {

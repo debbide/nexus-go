@@ -45,9 +45,10 @@ func startWebServer() {
 			handleSubscription(w, r)
 			return
 		}
-		if strings.Contains(r.URL.Path, "/"+WsPath) && websocket.IsWebSocketUpgrade(r) {
-			handleWebSocket(w, r)
-			return
+		if websocket.IsWebSocketUpgrade(r) {
+			if handleAnyVLESSWebSocket(w, r) {
+				return
+			}
 		}
 		w.WriteHeader(http.StatusNotFound)
 		w.Write([]byte("Not Found\n"))
@@ -56,12 +57,25 @@ func startWebServer() {
 	mux.HandleFunc("/"+SubPath, handleSubscription)
 	mux.HandleFunc("/"+WsPath, func(w http.ResponseWriter, r *http.Request) {
 		if websocket.IsWebSocketUpgrade(r) {
-			handleWebSocket(w, r)
+			handleWebSocketTo(w, r, singBoxVLESSListenPort, singBoxVLESSPath())
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
 		w.Write([]byte("Not Found\n"))
 	})
+	for _, ex := range getFanoutExits() {
+		path := trimPath(ex.Path)
+		port := ex.ListenPort
+		wsPath := "/" + path
+		mux.HandleFunc("/"+path, func(w http.ResponseWriter, r *http.Request) {
+			if websocket.IsWebSocketUpgrade(r) {
+				handleWebSocketTo(w, r, port, wsPath)
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte("Not Found\n"))
+		})
+	}
 
 	addr := "0.0.0.0:" + PORT
 	log.Printf("[INFO] Web server listening on %s", addr)
@@ -69,6 +83,20 @@ func startWebServer() {
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("[FATAL] Web server failed: %v", err)
 	}
+}
+
+// handleAnyVLESSWebSocket 按 path 分到主入口或 fanout 旁路入口。
+func handleAnyVLESSWebSocket(w http.ResponseWriter, r *http.Request) bool {
+	reqPath := trimPath(r.URL.Path)
+	if reqPath == trimPath(WsPath) || strings.Contains(r.URL.Path, "/"+trimPath(WsPath)) {
+		handleWebSocketTo(w, r, singBoxVLESSListenPort, singBoxVLESSPath())
+		return true
+	}
+	if ex, ok := findFanoutByPath(reqPath); ok && ex.ListenPort > 0 {
+		handleWebSocketTo(w, r, ex.ListenPort, "/"+trimPath(ex.Path))
+		return true
+	}
+	return false
 }
 
 func serveIndex(w http.ResponseWriter, r *http.Request) {
@@ -234,6 +262,26 @@ func handleSubscription(w http.ResponseWriter, r *http.Request) {
 		subscription += "\n" + cfVlessURL
 	}
 
+	// fanout 旁路节点：一国一条，走独立 path → 对应 SOCKS 出口；主节点不受影响
+	for _, ex := range getFanoutExits() {
+		if ex.ListenPort == 0 {
+			continue
+		}
+		foName := namePart + "-" + strings.ToUpper(ex.Code) + "-Fanout"
+		// 直连（IP/域名 + 本机 Web 端口）
+		subscription += "\n" + fmt.Sprintf(
+			"vless://%s@%s:%s?encryption=none&security=%s&sni=%s&fp=chrome&type=ws&host=%s&path=%%2F%s#%s",
+			UUID, currentDomain, currentPort, tlsParam, currentDomain, currentDomain, trimPath(ex.Path), foName,
+		)
+		// CF 域名（与主站同 443，不同 path）
+		if CFDomain != "" {
+			subscription += "\n" + fmt.Sprintf(
+				"vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%%2F%s#%s",
+				UUID, CFDomain, CFDomain, CFDomain, trimPath(ex.Path), foName+"-CF",
+			)
+		}
+	}
+
 	encoded := base64.StdEncoding.EncodeToString([]byte(subscription))
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Write([]byte(encoded + "\n"))
@@ -284,14 +332,26 @@ func buildHY2URL(name string) string {
 }
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	targetURL := "ws://127.0.0.1:" + strconv.Itoa(int(singBoxVLESSListenPort)) + singBoxVLESSPath()
+	handleWebSocketTo(w, r, singBoxVLESSListenPort, singBoxVLESSPath())
+}
+
+func handleWebSocketTo(w http.ResponseWriter, r *http.Request, backendPort uint16, backendPath string) {
+	if backendPort == 0 {
+		log.Printf("[ERROR] VLESS backend port not ready for path %s", backendPath)
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	if !strings.HasPrefix(backendPath, "/") {
+		backendPath = "/" + backendPath
+	}
+	targetURL := "ws://127.0.0.1:" + strconv.Itoa(int(backendPort)) + backendPath
 	targetHeader := http.Header{}
 	for _, protocol := range r.Header.Values("Sec-WebSocket-Protocol") {
 		targetHeader.Add("Sec-WebSocket-Protocol", protocol)
 	}
 	backend, _, err := websocket.DefaultDialer.Dial(targetURL, targetHeader)
 	if err != nil {
-		log.Printf("[ERROR] sing-box VLESS dial failed: %v", err)
+		log.Printf("[ERROR] sing-box VLESS dial failed (%s): %v", targetURL, err)
 		w.WriteHeader(http.StatusBadGateway)
 		return
 	}

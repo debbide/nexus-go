@@ -5,6 +5,7 @@ Nexus-Go 是一个轻量级的后端服务程序。本项目集成了基础网�
 ## 功能介绍
 - **静态编译**：使用 `CGO_ENABLED=0` 编译，无系统库依赖，兼容 Alpine 等极简环境。
 - **代理协议**：引入 Sing-box 核心库，支持 `VLESS-WS`、`TUIC` 与 `Hysteria2 (hy2)` 协议直连。
+- **Fanout 旁路出口**（可选）：对接同机 [fanout](https://github.com/byJoey/fanout) 的 SOCKS5，**一国一入口**；主代理仍走 direct，互不影响。
 - **网络优化**：针对 Cloudflare Tunnel 增加了 `TCP Keep-Alive` 和 `HTTP/2 ReadIdleTimeout`，优化在网络波动环境下的假死重连问题。
 - **日志控制**：生产环境中默认丢弃标准输出，降低运行内存开销。
 
@@ -35,6 +36,27 @@ Nexus-Go 是一个轻量级的后端服务程序。本项目集成了基础网�
 > - 默认 `UDP_IPV6_ONLY=false`：绑 `[::]`，常见 Linux 下为**双栈**。  
 > - `UDP_IPV6_ONLY=true`：绑本机全局 IPv6 地址，**服务端拒绝 IPv4**；无全局 IPv6 时启动失败。  
 > - 客户端侧也可用域名只加 AAAA / 只加 A 控制解析；不要把 UDP 域名套 Cloudflare 橙色云。
+
+### Fanout 旁路出口（可选，对接 byJoey/fanout）
+
+主 VLESS / TUIC / HY2 **出站仍为 direct**，不受影响。配置后额外生成「一国一条」VLESS-WS 旁路入口，流量经本机 fanout SOCKS 换出口。
+
+| 变量名 | 说明 | 默认值 |
+| :--- | :--- | :--- |
+| `FANOUT_EXITS` | 出口表，逗号分隔：`jp:127.0.0.1:11080,us:11081`（仅端口时 host 默认 `127.0.0.1`） | 空=不启用 |
+| `FANOUT_PATH_PREFIX` | 旁路 WS 路径前缀，实际 path 为 `{prefix}-{code}`，如 `/fo-jp` | `fo` |
+
+```bash
+# 1. 同机安装 fanout，按国家开隧道，记下 SOCKS 端口
+# 2. nexus .env：
+FANOUT_EXITS=jp:127.0.0.1:11080,us:127.0.0.1:11081,kr:11082
+# 3. 重启 nexus → 订阅多出 JP-Fanout / US-Fanout / …（CF 域名下同 443、不同 path）
+```
+
+- 客户端点主节点 → 母机 IP / CF；点 `xx-Fanout` → 对应 fanout 出口。  
+- fanout 槽位内故障换节点时 **SOCKS 端口不变**，nexus 无需改配置。  
+- 旁路仅 TCP（VLESS-WS）；TUIC/HY2 不走 fanout。  
+- fanout SOCKS 请只监听 `127.0.0.1`。
 
 ### 辅助功能 (可选)
 | 变量名 | 说明 | 默认值 |
