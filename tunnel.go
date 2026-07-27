@@ -437,7 +437,14 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 		err := proxyGRPCToOrigin(w, r)
 		live = grpcStreamLive.Add(-1)
 		dur := time.Since(start).Round(time.Millisecond)
-		throttledCloseIdle()
+		// When the last concurrent stream finishes, force-close the h2c pool so
+		// the next stream gets a fresh connection with a full flow-control window.
+		// During a burst (live>0) only throttle to avoid cascade teardown.
+		if live == 0 {
+			grpcH2cTransport.CloseIdleConnections()
+		} else {
+			throttledCloseIdle()
+		}
 		if err != nil {
 			tunnelLog.Printf("[TUNNEL] gRPC#%d FAIL live=%d dur=%s path=%s err=%v",
 				id, live, dur, r.URL.RequestURI(), err)
