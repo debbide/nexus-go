@@ -437,6 +437,7 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 		err := proxyGRPCToOrigin(w, r)
 		live = grpcStreamLive.Add(-1)
 		dur := time.Since(start).Round(time.Millisecond)
+		throttledCloseIdle()
 		if err != nil {
 			tunnelLog.Printf("[TUNNEL] gRPC#%d FAIL live=%d dur=%s path=%s err=%v",
 				id, live, dur, r.URL.RequestURI(), err)
