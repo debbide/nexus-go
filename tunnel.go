@@ -231,8 +231,9 @@ func cfTunnelConnect(connIndex uint8, accountTag string, tunnelSecret, tunnelID 
 
 	// In Cloudflare Tunnel protocol, we dial the edge, but act as an HTTP/2 server!
 	// The edge sends requests (like control-stream) to us.
+	// ReadIdleTimeout 过短会在代理静默/测速间隙误杀整条 h2 连接。
 	server := &http2.Server{
-		ReadIdleTimeout: 30 * time.Second,
+		ReadIdleTimeout: 5 * time.Minute,
 	}
 	server.ServeConn(conn, &http2.ServeConnOpts{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -241,6 +242,21 @@ func cfTunnelConnect(connIndex uint8, accountTag string, tunnelSecret, tunnelID 
 	})
 
 	return nil
+}
+
+// resolveWSOrigin 把 CF 入站 path 映射到本机真正的 VLESS-WS 后端。
+// 优先直连 sing-box，避开 web.go 二次 Upgrade（上传测速时 double-WS 极易首向失败整链断开）。
+func resolveWSOrigin(reqPath string) (addr, backendPath string, via string) {
+	p := trimPath(reqPath)
+	if p == trimPath(WsPath) && singBoxVLESSListenPort != 0 {
+		return fmt.Sprintf("127.0.0.1:%d", singBoxVLESSListenPort), singBoxVLESSPath(), "singbox"
+	}
+	if ex, ok := findFanoutByPath(p); ok && ex.ListenPort != 0 {
+		bp := "/" + trimPath(ex.Path)
+		return fmt.Sprintf("127.0.0.1:%d", ex.ListenPort), bp, "fanout-" + ex.Code
+	}
+	// 未知 WS path 仍回落到 Web 端口（可能是其它业务）
+	return "127.0.0.1:" + PORT, "", "web"
 }
 
 func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, accountTag string, tunnelSecret, tunnelID []byte) {
@@ -280,142 +296,234 @@ func handleEdgeRequest(w http.ResponseWriter, r *http.Request, connIndex uint8, 
 		strings.ToLower(r.Header.Get("Upgrade")) == "websocket"
 
 	if isWebSocket {
-		// ---- WebSocket 代理 ----
-		localConn, err := net.Dial("tcp", localAddr)
-		if err != nil {
-			w.WriteHeader(http.StatusBadGateway)
-			return
-		}
-		defer localConn.Close()
+		proxyCFWebSocket(w, r)
+		return
+	}
 
-		// 重建 HTTP/1.1 升级请求
-		var reqBuf strings.Builder
-		reqBuf.WriteString(fmt.Sprintf("GET %s HTTP/1.1\r\n", r.URL.RequestURI()))
-		hasHost := false
-		hasWSKey := false
-		hasWSVersion := false
-		for k, vv := range r.Header {
-			kLower := strings.ToLower(k)
-			if kLower == "connection" || kLower == "upgrade" {
-				continue
-			}
-			if kLower == "host" {
-				hasHost = true
-			}
-			if kLower == "sec-websocket-key" {
-				hasWSKey = true
-			}
-			if kLower == "sec-websocket-version" {
-				hasWSVersion = true
-			}
-			for _, v := range vv {
-				reqBuf.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
-			}
-		}
-		if !hasHost {
-			reqBuf.WriteString(fmt.Sprintf("Host: %s\r\n", r.Host))
-		}
-		if !hasWSKey {
-			reqBuf.WriteString(fmt.Sprintf("Sec-WebSocket-Key: %s\r\n", newWebSocketKey()))
-		}
-		if !hasWSVersion {
-			reqBuf.WriteString("Sec-WebSocket-Version: 13\r\n")
-		}
-		reqBuf.WriteString("Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
-		localConn.Write([]byte(reqBuf.String()))
+	// ---- 普通 HTTP 代理（主页、订阅等）----
+	// 读取请求体
+	bodyData, _ := io.ReadAll(r.Body)
 
-		// 读取本地 HTTP/1.1 响应头
-		br := bufio.NewReader(localConn)
-		resp, err := http.ReadResponse(br, r)
-		if err != nil {
-			return
-		}
+	// 构建转发请求
+	targetURL := fmt.Sprintf("http://%s%s", localAddr, r.URL.RequestURI())
+	proxyReq, err := http.NewRequest(r.Method, targetURL, bytes.NewReader(bodyData))
+	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
 
-		// 转发响应头给 CF 边缘（101 -> 200）
-		for k, vv := range resp.Header {
-			kLower := strings.ToLower(k)
-			if kLower == "connection" || kLower == "upgrade" || kLower == "transfer-encoding" || kLower == "keep-alive" {
-				continue
-			}
-			for _, v := range vv {
-				w.Header().Add(k, v)
-			}
+	for k, vv := range r.Header {
+		kLower := strings.ToLower(k)
+		if kLower == "host" {
+			continue
 		}
-		status := resp.StatusCode
-		if status == http.StatusSwitchingProtocols {
-			status = http.StatusOK
+		for _, v := range vv {
+			proxyReq.Header.Add(k, v)
 		}
-		w.WriteHeader(status)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
+	}
+	proxyReq.Host = r.Host
+
+	httpClient := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := httpClient.Do(proxyReq)
+	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// 转发响应头
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
 		}
+	}
+	w.WriteHeader(resp.StatusCode)
 
-		// 双向数据桥接
-		go func() {
-			io.Copy(localConn, r.Body)
-			if tcpConn, ok := localConn.(*net.TCPConn); ok {
-				tcpConn.CloseWrite()
-			}
-		}()
+	// 转发响应体
+	io.Copy(w, resp.Body)
+}
 
-		done := make(chan struct{})
-		go func() {
-			io.Copy(flushWriter{w: w}, br)
-			close(done)
-		}()
+// proxyCFWebSocket 把 CF 边缘的 H2 WebSocket 流桥到本机 VLESS-WS。
+//
+// 历史上这里先打到 Web 端口再 gorilla 二次 Upgrade，下载（本机→边缘，带 Flush）看起来正常，
+// 上传测速（边缘→本机，大帧灌入）却会在 double-WS / 单向先退出时整链断开。
+// 现在优先直连 sing-box；双向 copy 对称等待，任一侧结束只 half-close，不再“下载结束就拆整条”。
+func proxyCFWebSocket(w http.ResponseWriter, r *http.Request) {
+	originAddr, backendPath, via := resolveWSOrigin(r.URL.Path)
+	if backendPath == "" {
+		// 走 Web 端口时保留原始 RequestURI（含 query）
+		backendPath = r.URL.RequestURI()
+	} else if q := r.URL.RawQuery; q != "" && !strings.Contains(backendPath, "?") {
+		backendPath = backendPath + "?" + q
+	}
 
+	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 15 * time.Second}
+	localConn, err := dialer.Dial("tcp", originAddr)
+	if err != nil {
+		log.Printf("[TUNNEL] WS dial %s (%s) failed: %v", originAddr, via, err)
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	defer localConn.Close()
+	if tcpConn, ok := localConn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	// 重建 HTTP/1.1 升级请求（H2 没有 101，边缘用 Cf-Cloudflared-Proxy-Connection-Upgrade 标记）
+	var reqBuf strings.Builder
+	reqBuf.WriteString(fmt.Sprintf("GET %s HTTP/1.1\r\n", backendPath))
+	hasHost := false
+	hasWSKey := false
+	hasWSVersion := false
+	for k, vv := range r.Header {
+		kLower := strings.ToLower(k)
+		switch kLower {
+		case "connection", "upgrade", "transfer-encoding", "content-length",
+			"cf-cloudflared-proxy-connection-upgrade",
+			"cf-cloudflared-proxy-src-job",
+			"cf-connecting-ip", "cf-ray", "cdn-loop", "cf-visitor", "cf-warp-tag-id",
+			"x-forwarded-for", "x-forwarded-proto", "x-real-ip":
+			continue
+		}
+		if kLower == "host" {
+			hasHost = true
+		}
+		if kLower == "sec-websocket-key" {
+			hasWSKey = true
+		}
+		if kLower == "sec-websocket-version" {
+			hasWSVersion = true
+		}
+		for _, v := range vv {
+			reqBuf.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
+		}
+	}
+	if !hasHost {
+		// sing-box 主要按 path 匹配；Host 用本机地址即可
+		reqBuf.WriteString(fmt.Sprintf("Host: %s\r\n", originAddr))
+	}
+	if !hasWSKey {
+		reqBuf.WriteString(fmt.Sprintf("Sec-WebSocket-Key: %s\r\n", newWebSocketKey()))
+	}
+	if !hasWSVersion {
+		reqBuf.WriteString("Sec-WebSocket-Version: 13\r\n")
+	}
+	reqBuf.WriteString("Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+	if _, err := localConn.Write([]byte(reqBuf.String())); err != nil {
+		log.Printf("[TUNNEL] WS write upgrade failed via=%s: %v", via, err)
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+
+	br := bufio.NewReaderSize(localConn, 64*1024)
+	resp, err := http.ReadResponse(br, r)
+	if err != nil {
+		log.Printf("[TUNNEL] WS read upgrade response failed via=%s: %v", via, err)
+		return
+	}
+	// 101 响应体由 br 继续读；Header 已解析完
+
+	for k, vv := range resp.Header {
+		kLower := strings.ToLower(k)
+		if kLower == "connection" || kLower == "upgrade" || kLower == "transfer-encoding" || kLower == "keep-alive" {
+			continue
+		}
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	status := resp.StatusCode
+	if status == http.StatusSwitchingProtocols {
+		// HTTP/2 不支持 101，边缘约定改写为 200
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	if status != http.StatusOK {
+		log.Printf("[TUNNEL] WS origin status=%d via=%s path=%s", resp.StatusCode, via, backendPath)
+		return
+	}
+
+	pipeCFWebSocket(w, r, localConn, br, via)
+}
+
+// pipeCFWebSocket 全双工桥接：上传 edge body → local；下载 local → edge（每写即 Flush）。
+// 两侧都结束后再返回；任一侧结束只 half-close 对应方向，避免上传测速被下载侧抢先拆链。
+func pipeCFWebSocket(w http.ResponseWriter, r *http.Request, localConn net.Conn, br *bufio.Reader, via string) {
+	start := time.Now()
+	var (
+		upErr   error
+		downErr error
+		upN     int64
+		downN   int64
+	)
+	done := make(chan struct{}, 2)
+
+	// 上传：CF 边缘 → 本机（测速上传热路径）
+	go func() {
+		defer func() { done <- struct{}{} }()
+		buf := make([]byte, 64*1024)
+		upN, upErr = io.CopyBuffer(localConn, r.Body, buf)
+		if tcpConn, ok := localConn.(*net.TCPConn); ok {
+			_ = tcpConn.CloseWrite()
+		}
+	}()
+
+	// 下载：本机 → CF 边缘（必须 Flush，否则 h2 会攒包导致对端以为卡死）
+	go func() {
+		defer func() { done <- struct{}{} }()
+		buf := make([]byte, 64*1024)
+		downN, downErr = io.CopyBuffer(flushWriter{w: w}, br, buf)
+		if tcpConn, ok := localConn.(*net.TCPConn); ok {
+			_ = tcpConn.CloseRead()
+		}
+		// 下载结束时顺带取消 request body，促使上传 copy 退出
+		_ = r.Body.Close()
+	}()
+
+	finished := 0
+	for finished < 2 {
 		select {
 		case <-done:
+			finished++
 		case <-r.Context().Done():
-		}
-
-	} else {
-		// ---- 普通 HTTP 代理（主页、订阅等）----
-		// 读取请求体
-		bodyData, _ := io.ReadAll(r.Body)
-
-		// 构建转发请求
-		targetURL := fmt.Sprintf("http://%s%s", localAddr, r.URL.RequestURI())
-		proxyReq, err := http.NewRequest(r.Method, targetURL, bytes.NewReader(bodyData))
-		if err != nil {
-			w.WriteHeader(http.StatusBadGateway)
-			return
-		}
-
-		for k, vv := range r.Header {
-			kLower := strings.ToLower(k)
-			if kLower == "host" {
-				continue
-			}
-			for _, v := range vv {
-				proxyReq.Header.Add(k, v)
+			_ = localConn.Close()
+			_ = r.Body.Close()
+			// 再收完两个 goroutine，避免泄漏
+			for finished < 2 {
+				<-done
+				finished++
 			}
 		}
-		proxyReq.Host = r.Host
-
-		httpClient := &http.Client{
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}
-		resp, err := httpClient.Do(proxyReq)
-		if err != nil {
-			w.WriteHeader(http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
-
-		// 转发响应头
-		for k, vv := range resp.Header {
-			for _, v := range vv {
-				w.Header().Add(k, v)
-			}
-		}
-		w.WriteHeader(resp.StatusCode)
-
-		// 转发响应体
-		io.Copy(w, resp.Body)
 	}
+
+	if upErr != nil && upErr != io.EOF && !isClosedNetErr(upErr) {
+		log.Printf("[TUNNEL] WS upload end via=%s n=%d err=%v dur=%s", via, upN, upErr, time.Since(start).Round(time.Millisecond))
+	}
+	if downErr != nil && downErr != io.EOF && !isClosedNetErr(downErr) {
+		log.Printf("[TUNNEL] WS download end via=%s n=%d err=%v dur=%s", via, downN, downErr, time.Since(start).Round(time.Millisecond))
+	}
+}
+
+func isClosedNetErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == io.ErrClosedPipe || err == net.ErrClosed {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "broken pipe")
 }
 
 func newWebSocketKey() string {

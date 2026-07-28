@@ -349,7 +349,11 @@ func handleWebSocketTo(w http.ResponseWriter, r *http.Request, backendPort uint1
 	for _, protocol := range r.Header.Values("Sec-WebSocket-Protocol") {
 		targetHeader.Add("Sec-WebSocket-Protocol", protocol)
 	}
-	backend, _, err := websocket.DefaultDialer.Dial(targetURL, targetHeader)
+	// 上传测速会灌大帧；放大缓冲，避免默认 4KiB 读缓冲导致频繁 syscall
+	dialer := *websocket.DefaultDialer
+	dialer.ReadBufferSize = 64 * 1024
+	dialer.WriteBufferSize = 64 * 1024
+	backend, _, err := dialer.Dial(targetURL, targetHeader)
 	if err != nil {
 		log.Printf("[ERROR] sing-box VLESS dial failed (%s): %v", targetURL, err)
 		w.WriteHeader(http.StatusBadGateway)
@@ -357,24 +361,37 @@ func handleWebSocketTo(w http.ResponseWriter, r *http.Request, backendPort uint1
 	}
 	defer backend.Close()
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	upgraderLocal := upgrader
+	upgraderLocal.ReadBufferSize = 64 * 1024
+	upgraderLocal.WriteBufferSize = 64 * 1024
+	upgraderLocal.EnableCompression = false
+	conn, err := upgraderLocal.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("[ERROR] WS Upgrade failed: %v", err)
 		return
 	}
 	defer conn.Close()
 
+	// 双向桥接：一侧结束后关闭对端写，再等另一侧，避免上传测速被下载侧抢先整链拆掉
 	done := make(chan struct{}, 2)
 	go copyWebSocketMessages(conn, backend, done)
 	go copyWebSocketMessages(backend, conn, done)
+	<-done
+	_ = conn.Close()
+	_ = backend.Close()
 	<-done
 }
 
 func copyWebSocketMessages(dst, src *websocket.Conn, done chan<- struct{}) {
 	defer func() { done <- struct{}{} }()
+	src.SetReadLimit(8 << 20) // 8MiB，覆盖测速大帧
 	for {
 		messageType, payload, err := src.ReadMessage()
 		if err != nil {
+			// 半关闭：通知对端本方向结束，让另一侧 copy 也能尽快退出
+			_ = dst.WriteControl(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+				time.Now().Add(2*time.Second))
 			return
 		}
 		if messageType != websocket.BinaryMessage && messageType != websocket.TextMessage {
