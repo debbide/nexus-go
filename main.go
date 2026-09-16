@@ -92,6 +92,12 @@ func initEnv() {
 	if WsPath == "" && len(UUID) >= 8 {
 		WsPath = UUID[:8]
 	}
+	// WSPATH 是硬性要求的：空值会注册 "/" 路由，与首页冲突，
+	// 也会让 sing-box 的 VLESS 入站路径退化成 "/"。UUID 异常时兜个底。
+	if trimPath(WsPath) == "" {
+		WsPath = "vless"
+		log.Printf("[WARN] WSPATH empty, falling back to %q", WsPath)
+	}
 	NodeName = os.Getenv("NAME")
 	TUICPort = os.Getenv("TUIC_PORT")
 	TUICDomain = os.Getenv("TUIC_DOMAIN")

@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/nezhahq/agent/proto"
@@ -37,11 +38,12 @@ import (
 const nezhaAgentVersion = "Nexus-Go v1.0.0"
 
 var (
-	lastNetIn         uint64
-	lastNetOut        uint64
-	lastNetTime       int64
-	bootTime          uint64
-	dashboardBootTime uint64
+	lastNetIn   uint64
+	lastNetOut  uint64
+	lastNetTime int64
+	bootTime    uint64
+	// dashboardBootTime 由 reportHostLoop 写、geoIPReportLoop 读，用原子量避免数据竞争
+	dashboardBootTime atomic.Uint64
 )
 
 func init() {
@@ -121,7 +123,7 @@ func nezhaLoop(target string) error {
 	if err != nil {
 		return fmt.Errorf("ReportSystemInfo2: %w", err)
 	}
-	dashboardBootTime = receipt.Data
+	dashboardBootTime.Store(receipt.Data)
 
 	errCh := make(chan error, 2)
 	go reportHostLoop(ctx, client)
@@ -182,11 +184,24 @@ func runTaskStream(ctx context.Context, client pb.NezhaServiceClient) error {
 	}
 	resultCh := make(chan *pb.TaskResult, 32)
 	sendErrCh := make(chan error, 1)
+	// done 在函数返回时关闭：发送协程与各 handleTask 据此退出，
+	// 否则 Recv 出错返回后它们会永久阻塞在 channel 上（每断一次泄漏一批 goroutine）
+	done := make(chan struct{})
+	defer close(done)
+
 	go func() {
-		for result := range resultCh {
-			if err := stream.Send(result); err != nil {
-				sendErrCh <- err
+		for {
+			select {
+			case <-done:
 				return
+			case result := <-resultCh:
+				if err := stream.Send(result); err != nil {
+					select {
+					case sendErrCh <- err:
+					default:
+					}
+					return
+				}
 			}
 		}
 	}()
@@ -201,11 +216,11 @@ func runTaskStream(ctx context.Context, client pb.NezhaServiceClient) error {
 			return fmt.Errorf("task Send: %w", err)
 		default:
 		}
-		go handleTask(ctx, client, task, resultCh)
+		go handleTask(ctx, client, task, resultCh, done)
 	}
 }
 
-func handleTask(ctx context.Context, client pb.NezhaServiceClient, task *pb.Task, resultCh chan<- *pb.TaskResult) {
+func handleTask(ctx context.Context, client pb.NezhaServiceClient, task *pb.Task, resultCh chan<- *pb.TaskResult, done <-chan struct{}) {
 	result := &pb.TaskResult{Id: task.Id, Type: task.Type, Successful: false}
 	switch task.Type {
 	case taskTypeKeepalive:
@@ -236,7 +251,10 @@ func handleTask(ctx context.Context, client pb.NezhaServiceClient, task *pb.Task
 		log.Printf("[NEZHA] Unsupported task type: %d", task.Type)
 		return
 	}
-	resultCh <- result
+	select {
+	case resultCh <- result:
+	case <-done:
+	}
 }
 
 func doHTTPGet(task *pb.Task, result *pb.TaskResult) {
@@ -627,7 +645,7 @@ func reportHostLoop(ctx context.Context, client pb.NezhaServiceClient) {
 			return
 		case <-ticker.C:
 			if receipt, err := client.ReportSystemInfo2(ctx, collectHost()); err == nil {
-				dashboardBootTime = receipt.Data
+				dashboardBootTime.Store(receipt.Data)
 			}
 		}
 	}
@@ -854,7 +872,7 @@ func fetchGeoIP() (*pb.GeoIP, string) {
 	return &pb.GeoIP{
 		Ip:                &pb.IP{Ipv4: ipv4, Ipv6: ipv6},
 		Use6:              NezhaUseIPv6CountryCode,
-		DashboardBootTime: dashboardBootTime,
+		DashboardBootTime: dashboardBootTime.Load(),
 	}, selected
 }
 

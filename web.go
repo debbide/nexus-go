@@ -34,6 +34,27 @@ var (
 )
 
 func startWebServer() {
+	// SUB_PATH / WSPATH / fanout path 都来自环境变量，完全可能互相撞车。
+	// http.ServeMux 对重复 pattern 会直接 panic（启动即崩），这里先显式校验，
+	// 撞车时给出可读的 FATAL，而不是一个难懂的 mux panic。
+	claimed := map[string]string{}
+	claim := func(path, what string) {
+		p := "/" + trimPath(path)
+		if trimPath(path) == "" {
+			log.Printf("[WARN] %s is empty, route skipped", what)
+			return
+		}
+		if prev, ok := claimed[p]; ok {
+			log.Fatalf("[FATAL] route %q requested by %s conflicts with %s; adjust SUB_PATH/WSPATH/FANOUT_PATH_PREFIX", p, what, prev)
+		}
+		claimed[p] = what
+	}
+	claim(SubPath, "SUB_PATH")
+	claim(WsPath, "WSPATH")
+	for _, ex := range getFanoutExits() {
+		claim(ex.Path, "fanout-"+ex.Code)
+	}
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -41,7 +62,7 @@ func startWebServer() {
 			serveIndex(w, r)
 			return
 		}
-		if r.URL.Path == "/"+SubPath {
+		if SubPath != "" && r.URL.Path == "/"+trimPath(SubPath) {
 			handleSubscription(w, r)
 			return
 		}
@@ -54,17 +75,24 @@ func startWebServer() {
 		w.Write([]byte("Not Found\n"))
 	})
 
-	mux.HandleFunc("/"+SubPath, handleSubscription)
-	mux.HandleFunc("/"+WsPath, func(w http.ResponseWriter, r *http.Request) {
-		if websocket.IsWebSocketUpgrade(r) {
-			handleWebSocketTo(w, r, singBoxVLESSListenPort, singBoxVLESSPath())
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte("Not Found\n"))
-	})
+	if trimPath(SubPath) != "" {
+		mux.HandleFunc("/"+trimPath(SubPath), handleSubscription)
+	}
+	if trimPath(WsPath) != "" {
+		mux.HandleFunc("/"+trimPath(WsPath), func(w http.ResponseWriter, r *http.Request) {
+			if websocket.IsWebSocketUpgrade(r) {
+				handleWebSocketTo(w, r, singBoxVLESSListenPort, singBoxVLESSPath())
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte("Not Found\n"))
+		})
+	}
 	for _, ex := range getFanoutExits() {
 		path := trimPath(ex.Path)
+		if path == "" {
+			continue
+		}
 		port := ex.ListenPort
 		wsPath := "/" + path
 		mux.HandleFunc("/"+path, func(w http.ResponseWriter, r *http.Request) {
@@ -79,7 +107,13 @@ func startWebServer() {
 
 	addr := "0.0.0.0:" + PORT
 	log.Printf("[INFO] Web server listening on %s", addr)
-	server := &http.Server{Addr: addr, Handler: mux}
+	server := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+		// 没有 ReadHeaderTimeout 的话，慢速发 header 的连接可以一直占着；
+		// 不设 WriteTimeout 是因为 WS 是长连接。
+		ReadHeaderTimeout: 15 * time.Second,
+	}
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("[FATAL] Web server failed: %v", err)
 	}
@@ -88,7 +122,10 @@ func startWebServer() {
 // handleAnyVLESSWebSocket 按 path 分到主入口或 fanout 旁路入口。
 func handleAnyVLESSWebSocket(w http.ResponseWriter, r *http.Request) bool {
 	reqPath := trimPath(r.URL.Path)
-	if reqPath == trimPath(WsPath) || strings.Contains(r.URL.Path, "/"+trimPath(WsPath)) {
+	mainPath := trimPath(WsPath)
+	// 精确匹配，或作为一段前缀（/<wsPath>/...）匹配；
+	// 不用 strings.Contains：那会把任何“路径里含该片段”的请求都放进 VLESS 后端。
+	if mainPath != "" && (reqPath == mainPath || strings.HasPrefix(reqPath, mainPath+"/")) {
 		handleWebSocketTo(w, r, singBoxVLESSListenPort, singBoxVLESSPath())
 		return true
 	}
